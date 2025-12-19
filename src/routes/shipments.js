@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { listShipments, createTransfer, createPalletTransfer, deliverShipment, updateEDD, dueToday, backfillReferences } from '../controllers/shipmentsController.js';
+import { listShipments, createTransfer, createPalletTransfer, deliverShipment, updateEDD, dueToday, backfillReferences, backfillOwNumbers } from '../controllers/shipmentsController.js';
 
 const router = Router();
 
@@ -10,5 +10,6 @@ router.post('/transfer-pallet', createPalletTransfer);
 router.post('/:id/deliver', deliverShipment);
 router.put('/:id/edd', updateEDD);
 router.post('/backfill-references', backfillReferences);
+router.post('/backfill-ow-numbers', backfillOwNumbers);
 
 export default router;

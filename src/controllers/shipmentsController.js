@@ -12,14 +12,51 @@ export const listShipments = async (req, res) => {
   const { status } = req.query;
   const q = {};
   if (status) q.status = status;
-  const qtext = (req.query.q || '').toString().trim();
-  if (qtext) {
-    const regex = { $regex: qtext, $options: 'i' };
-    q.$or = [
-      { reference: regex },
-      { 'items.itemCode': regex }
-    ];
+
+  const legacyQ = (req.query.q || '').toString().trim();
+  const qRef = (req.query.qRef || '').toString().trim();
+  const qPallet = (req.query.qPallet || '').toString().trim();
+  const eddFromRaw = (req.query.eddFrom || '').toString().trim();
+  const eddToRaw = (req.query.eddTo || '').toString().trim();
+
+  const and = [];
+
+  const refText = qRef || legacyQ;
+  if (refText) {
+    const regex = { $regex: refText, $options: 'i' };
+    and.push({
+      $or: [
+        { owNumber: regex },
+        { reference: regex }
+      ]
+    });
   }
+
+  if (qPallet) {
+    const regex = { $regex: qPallet, $options: 'i' };
+    and.push({ $or: [{ notes: regex }, { 'items.itemCode': regex }] });
+  } else if (legacyQ && !qRef) {
+    // legacy behavior: q also searches pallet/notes + item codes when qRef isn't used
+    const regex = { $regex: legacyQ, $options: 'i' };
+    and.push({ $or: [{ notes: regex }, { 'items.itemCode': regex }] });
+  }
+
+  if (eddFromRaw || eddToRaw) {
+    const range = {};
+    if (eddFromRaw) {
+      const d = new Date(`${eddFromRaw}T00:00:00`);
+      if (!isNaN(d.getTime())) range.$gte = d;
+    }
+    if (eddToRaw) {
+      const d = new Date(`${eddToRaw}T23:59:59`);
+      if (!isNaN(d.getTime())) range.$lte = d;
+    }
+    if (Object.keys(range).length) {
+      and.push({ estDeliveryDate: range });
+    }
+  }
+
+  if (and.length) q.$and = and;
   const page = Math.max(0, parseInt(req.query.page?.toString() || '0', 10));
   const pageSize = Math.max(1, Math.min(200, parseInt(req.query.pageSize?.toString() || '20', 10)));
   const total = await Shipment.countDocuments(q);
@@ -362,4 +399,26 @@ export const backfillReferences = async (req, res) => {
     }
   }
   res.json({ message: 'backfill complete', updated, totalCandidates: ships.length });
+};
+
+export const backfillOwNumbers = async (req, res) => {
+  const q = { $or: [{ owNumber: { $exists: false } }, { owNumber: '' }] };
+  const ships = await Shipment.find(q).sort({ createdAt: 1 }).lean();
+  let updated = 0;
+  for (const s of ships) {
+    try {
+      const ctr = await Counter.findOneAndUpdate(
+        { name: 'shipment_ow' },
+        { $inc: { seq: 1 } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      const num = String(ctr.seq).padStart(4, '0');
+      const owNumber = `OW-${num}`;
+      await Shipment.updateOne({ _id: s._id }, { $set: { owNumber } });
+      updated += 1;
+    } catch (e) {
+      // skip this shipment on error
+    }
+  }
+  res.json({ message: 'backfill owNumber complete', updated, totalCandidates: ships.length });
 };

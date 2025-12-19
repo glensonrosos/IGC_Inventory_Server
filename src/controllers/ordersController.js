@@ -6,10 +6,20 @@ import Warehouse from '../models/Warehouse.js';
 import ItemGroup from '../models/ItemGroup.js';
 import PalletGroupStock from '../models/PalletGroupStock.js';
 import PalletGroupTxn from '../models/PalletGroupTxn.js';
+import Shipment from '../models/Shipment.js';
+import OnProcessPallet from '../models/OnProcessPallet.js';
+import OnProcessBatch from '../models/OnProcessBatch.js';
 import FulfilledOrderImport from '../models/FulfilledOrderImport.js';
 import UnfulfilledOrder from '../models/UnfulfilledOrder.js';
 
 const normalizeStr = (v) => (v == null ? '' : String(v)).trim();
+
+const fmtDateYmd = (d) => {
+  if (!d) return '';
+  const dt = d instanceof Date ? d : new Date(d);
+  if (Number.isNaN(dt.getTime())) return '';
+  return dt.toISOString().slice(0, 10);
+};
 
 const normalizeHeaderKey = (v) =>
   normalizeStr(v)
@@ -465,6 +475,154 @@ export const createUnfulfilledOrder = async (req, res) => {
   res.status(201).json(doc);
 };
 
+export const palletPicker = async (req, res) => {
+  try {
+    const warehouseId = String(req.query.warehouseId || '').trim();
+    const q = normalizeStr(req.query.q || '').toLowerCase();
+    if (!warehouseId) return res.status(400).json({ message: 'warehouseId required' });
+
+    const warehouses = await Warehouse.find({}).select('name').sort({ name: 1 }).lean();
+    const whIds = (warehouses || []).map((w) => String(w._id));
+
+    const groups = await ItemGroup.find({ active: true }).select('name lineItem').lean();
+
+    // Warehouse availability per group
+    const stocks = await PalletGroupStock.aggregate([
+      { $addFields: { warehouseIdStr: { $toString: '$warehouseId' } } },
+      { $match: { warehouseIdStr: { $in: whIds } } },
+      { $group: { _id: { groupName: '$groupName', warehouseId: '$warehouseIdStr' }, pallets: { $sum: '$pallets' } } },
+    ]);
+    const stockByGroup = new Map();
+    for (const s of stocks) {
+      const groupName = String(s?._id?.groupName || '').trim();
+      const wid = String(s?._id?.warehouseId || '').trim();
+      if (!groupName || !wid) continue;
+      if (!stockByGroup.has(groupName)) stockByGroup.set(groupName, {});
+      stockByGroup.get(groupName)[wid] = Number(s.pallets || 0);
+    }
+
+    // On-water per group for the selected warehouse: sum pallets + earliest EDD
+    const ships = await Shipment.find({
+      status: 'on_water',
+      warehouseId,
+      notes: { $regex: 'pallet-group:', $options: 'i' },
+    })
+      .select('notes estDeliveryDate')
+      .lean();
+    const onWater = new Map();
+    const onWaterEdd = new Map();
+    const re = /pallet-group:([^;|]+);\s*pallets:(\d+)/gi;
+    for (const s of ships) {
+      const text = String(s?.notes || '');
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const groupName = String(m[1] || '').trim();
+        const pallets = Number(m[2] || 0);
+        if (!groupName || !Number.isFinite(pallets) || pallets <= 0) continue;
+        onWater.set(groupName, (onWater.get(groupName) || 0) + pallets);
+        const d = s?.estDeliveryDate ? new Date(s.estDeliveryDate) : null;
+        if (d && !Number.isNaN(d.getTime())) {
+          const prev = onWaterEdd.get(groupName);
+          if (!prev || d.getTime() < prev.getTime()) onWaterEdd.set(groupName, d);
+        }
+      }
+    }
+
+    // On-process per group: remaining pallets (total - transferred) and earliest estFinishDate across batches
+    const opAgg = await OnProcessPallet.aggregate([
+      { $match: { status: { $ne: 'cancelled' } } },
+      {
+        $addFields: {
+          remaining: { $subtract: ['$totalPallet', { $ifNull: ['$transferredPallet', 0] }] },
+        },
+      },
+      { $match: { remaining: { $gt: 0 } } },
+      {
+        $lookup: {
+          from: OnProcessBatch.collection.name,
+          localField: 'batchId',
+          foreignField: '_id',
+          as: 'batch',
+        },
+      },
+      { $unwind: { path: '$batch', preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: '$groupName',
+          pallets: { $sum: '$remaining' },
+          minEdd: { $min: '$batch.estFinishDate' },
+        },
+      },
+    ]);
+    const onProcess = new Map();
+    const onProcessEdd = new Map();
+    for (const r of opAgg) {
+      const groupName = String(r?._id || '').trim();
+      if (!groupName) continue;
+      onProcess.set(groupName, Number(r.pallets || 0));
+      const d = r?.minEdd ? new Date(r.minEdd) : null;
+      if (d && !Number.isNaN(d.getTime())) onProcessEdd.set(groupName, d);
+    }
+
+    // Queued demand: existing open orders in this warehouse that will consume supply tiers before new orders
+    const openStatuses = ['create', 'backorder', 'created'];
+    const unfulfilledQueuedAgg = await UnfulfilledOrder.aggregate([
+      { $addFields: { warehouseIdStr: { $toString: '$warehouseId' } } },
+      { $match: { warehouseIdStr: String(warehouseId), status: { $in: openStatuses } } },
+      { $unwind: '$lines' },
+      { $group: { _id: '$lines.groupName', pallets: { $sum: '$lines.qty' } } },
+    ]);
+    const importQueuedAgg = await FulfilledOrderImport.aggregate([
+      { $addFields: { warehouseIdStr: { $toString: '$warehouseId' } } },
+      { $match: { warehouseIdStr: String(warehouseId), status: { $in: openStatuses } } },
+      { $unwind: '$lines' },
+      { $group: { _id: '$lines.groupName', pallets: { $sum: '$lines.qty' } } },
+    ]);
+    const queued = new Map();
+    for (const r of [...(unfulfilledQueuedAgg || []), ...(importQueuedAgg || [])]) {
+      const groupName = String(r?._id || '').trim();
+      if (!groupName) continue;
+      queued.set(groupName, (queued.get(groupName) || 0) + Number(r.pallets || 0));
+    }
+
+    const rows = (groups || [])
+      .map((g) => {
+        const groupName = String(g?.name || '').trim();
+        const lineItem = String(g?.lineItem || '').trim();
+        const perWarehouse = stockByGroup.get(groupName) || {};
+        const selectedWarehouseAvailable = Number(perWarehouse[String(warehouseId)] || 0);
+        return {
+          groupName,
+          lineItem,
+          perWarehouse,
+          selectedWarehouseAvailable,
+          queuedPallets: Number(queued.get(groupName) || 0),
+          onWaterPallets: Number(onWater.get(groupName) || 0),
+          onWaterEdd: fmtDateYmd(onWaterEdd.get(groupName) || null) || '',
+          onProcessPallets: Number(onProcess.get(groupName) || 0),
+          onProcessEdd: fmtDateYmd(onProcessEdd.get(groupName) || null) || '',
+        };
+      })
+      .filter((r) => {
+        if (!q) return true;
+        return (
+          String(r.groupName || '').toLowerCase().includes(q) ||
+          String(r.lineItem || '').toLowerCase().includes(q)
+        );
+      })
+      .sort((a, b) => String(a.groupName).localeCompare(String(b.groupName)));
+
+    res.json({
+      warehouseId,
+      warehouses: (warehouses || []).map((w) => ({ _id: String(w._id), name: w.name })),
+      rows,
+    });
+  } catch (e) {
+    console.error('orders.palletPicker failed', e);
+    res.status(500).json({ message: 'Failed to load pallet picker data' });
+  }
+};
+
 export const listUnfulfilledOrders = async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query?.limit) || 200, 1), 1000);
   const docs = await UnfulfilledOrder.find({})
@@ -627,9 +785,9 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
 
 export const updateUnfulfilledOrderDetails = async (req, res) => {
   const { id } = req.params;
-  const { customerName, customerEmail, customerPhone, estFulfillmentDate, shippingAddress } = req.body || {};
+  const { customerName, customerEmail, customerPhone, estFulfillmentDate, shippingAddress, lines } = req.body || {};
 
-  const existing = await UnfulfilledOrder.findById(id).select('status').lean();
+  const existing = await UnfulfilledOrder.findById(id).select('status warehouseId orderNumber lines').lean();
   if (!existing) return res.status(404).json({ message: 'Order not found' });
   if (String(existing.status || '') === 'fulfilled') return res.status(400).json({ message: 'Fulfilled orders are locked' });
 
@@ -641,6 +799,101 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
   if (estFulfillmentDate !== undefined) {
     const s = normalizeStr(estFulfillmentDate);
     set.estFulfillmentDate = s ? new Date(s) : null;
+  }
+
+  const prevStatus = normalizeOrderStatus(existing.status || 'create') || 'create';
+
+  if (lines !== undefined) {
+    if (!Array.isArray(lines)) return res.status(400).json({ message: 'lines must be an array' });
+
+    const byLineItemLower = await buildLineItemMap();
+    const byGroupLower = await buildGroupNameMap();
+
+    const parsedLines = [];
+    for (const ln of lines) {
+      const search = normalizeStr(ln?.search || ln?.lineItem || ln?.groupName || '');
+      const qty = Number(ln?.qty);
+      if (!search) return res.status(400).json({ message: 'pallet id required' });
+      if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ message: 'qty must be > 0' });
+      const groupName = resolveGroupName({ input: search, byGroupLower, byLineItemLower });
+      if (!groupName) return res.status(400).json({ message: `Unknown Pallet Description / Pallet ID: ${search}` });
+      const g = await ItemGroup.findOne({ name: groupName }).select('lineItem name').lean();
+      parsedLines.push({
+        groupName,
+        lineItem: (normalizeStr(ln?.lineItem) || g?.lineItem || search).trim(),
+        qty: Math.floor(qty),
+      });
+    }
+
+    // De-duplicate by groupName (sum qty)
+    const merged = new Map();
+    for (const ln of parsedLines) {
+      merged.set(ln.groupName, (merged.get(ln.groupName) || 0) + Number(ln.qty || 0));
+    }
+    const nextLines = Array.from(merged.entries()).map(([groupName, qty]) => ({
+      groupName,
+      lineItem: parsedLines.find((p) => p.groupName === groupName)?.lineItem || '',
+      qty: Math.floor(Number(qty || 0)),
+    }));
+
+    // Inventory adjustment only applies if order is currently consuming inventory
+    if (prevStatus === 'create' || prevStatus === 'backorder' || prevStatus === 'created') {
+      const prevMap = new Map();
+      for (const ln of (existing.lines || [])) {
+        const k = String(ln?.groupName || '').trim();
+        if (!k) continue;
+        prevMap.set(k, (prevMap.get(k) || 0) + Number(ln?.qty || 0));
+      }
+      const nextMap = new Map();
+      for (const ln of nextLines) {
+        const k = String(ln?.groupName || '').trim();
+        if (!k) continue;
+        nextMap.set(k, (nextMap.get(k) || 0) + Number(ln?.qty || 0));
+      }
+
+      const allKeys = new Set([...prevMap.keys(), ...nextMap.keys()]);
+      const incLines = [];
+      const decLines = [];
+      for (const k of allKeys) {
+        const prevQty = Number(prevMap.get(k) || 0);
+        const nextQty = Number(nextMap.get(k) || 0);
+        const delta = nextQty - prevQty;
+        if (delta > 0) incLines.push({ groupName: k, qty: delta });
+        if (delta < 0) decLines.push({ groupName: k, qty: Math.abs(delta) });
+      }
+
+      const committedBy = String(req.user?.username || req.user?.id || '');
+      const whId = existing.warehouseId;
+      const orderNumber = existing.orderNumber;
+      const allowNegative = prevStatus === 'backorder';
+
+      // Restore first (gives stock back) then deduct additions.
+      if (decLines.length > 0) {
+        await applyInventoryDeltaForOrder({
+          warehouseId: whId,
+          orderNumber,
+          lines: decLines,
+          committedBy,
+          deltaSign: +1,
+          allowNegative: true,
+          reason: 'order_edit_restore',
+        });
+      }
+      if (incLines.length > 0) {
+        // If create, do not allow negative.
+        await applyInventoryDeltaForOrder({
+          warehouseId: whId,
+          orderNumber,
+          lines: incLines,
+          committedBy,
+          deltaSign: -1,
+          allowNegative,
+          reason: 'order_edit_deduct',
+        });
+      }
+    }
+
+    set.lines = nextLines;
   }
 
   const doc = await UnfulfilledOrder.findByIdAndUpdate(
