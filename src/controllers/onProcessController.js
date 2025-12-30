@@ -9,6 +9,7 @@ import ItemGroup from '../models/ItemGroup.js';
 import Shipment from '../models/Shipment.js';
 import PalletGroupStock from '../models/PalletGroupStock.js';
 import PalletGroupTxn from '../models/PalletGroupTxn.js';
+import PalletGroupReservation from '../models/PalletGroupReservation.js';
 
 export const listOnProcess = async (req, res) => {
   const pallets = await OnProcessPallet.find({}).sort({ createdAt: -1 }).lean();
@@ -110,13 +111,20 @@ export const importOnProcess = async (req, res) => {
       for (const po of Object.keys(byPo)) {
         let batch = await OnProcessBatch.findOne({ poNumber: po });
         if (!batch) {
+          const d = new Date();
+          d.setMonth(d.getMonth() + 1);
           const c = await Counter.findOneAndUpdate(
             { name: 'on_process' },
             { $inc: { seq: 1 } },
             { upsert: true, new: true }
           );
           const ref = `PROC-${String(c.seq).padStart(6, '0')}`;
-          batch = await OnProcessBatch.create({ poNumber: po, reference: ref, createdBy: req.user?.id });
+          batch = await OnProcessBatch.create({ poNumber: po, reference: ref, estFinishDate: d, createdBy: req.user?.id });
+        } else if (!batch.estFinishDate) {
+          const d = new Date();
+          d.setMonth(d.getMonth() + 1);
+          batch.estFinishDate = d;
+          await batch.save();
         }
         for (const r of byPo[po]) {
           docs.push({ ...r, batchId: batch._id, createdBy: req.user?.id });
@@ -305,13 +313,20 @@ export const importOnProcessPallets = async (req, res) => {
       for (const po of Object.keys(byPo)) {
         let batch = await OnProcessBatch.findOne({ poNumber: po });
         if (!batch) {
+          const d = new Date();
+          d.setMonth(d.getMonth() + 1);
           const c = await Counter.findOneAndUpdate(
             { name: 'on_process' },
             { $inc: { seq: 1 } },
             { upsert: true, new: true }
           );
           const ref = `PROC-${String(c.seq).padStart(6, '0')}`;
-          batch = await OnProcessBatch.create({ poNumber: po, reference: ref, createdBy: req.user?.id });
+          batch = await OnProcessBatch.create({ poNumber: po, reference: ref, estFinishDate: d, createdBy: req.user?.id });
+        } else if (!batch.estFinishDate) {
+          const d = new Date();
+          d.setMonth(d.getMonth() + 1);
+          batch.estFinishDate = d;
+          await batch.save();
         }
         for (const r of byPo[po]) docs.push({ ...r, batchId: batch._id, createdBy: req.user?.id });
       }
@@ -470,6 +485,7 @@ export const transferBatchPallets = async (req, res) => {
   if (!batch) return res.status(404).json({ message: 'batch not found' });
   const poNumber = batch.poNumber;
   const now = new Date();
+  const committedBy = String(req.user?.username || req.user?.id || '').trim();
 
   // aggregate pallets to transfer per group
   const toTransfer = items
@@ -478,6 +494,54 @@ export const transferBatchPallets = async (req, res) => {
   if (!toTransfer.length) return res.status(400).json({ message: 'no valid items to transfer' });
 
   if (mode === 'delivered') {
+    const migrateOnProcessToPrimary = async ({ groupName, pallets }) => {
+      const wid = String(warehouseId || '').trim();
+      const g = String(groupName || '').trim();
+      let remaining = Math.max(0, Math.floor(Number(pallets || 0)));
+      if (!wid || !g || !remaining) return;
+
+      const toMove = await PalletGroupReservation.find({
+        warehouseId: wid,
+        groupName: g,
+        source: 'on_process',
+        qty: { $gt: 0 },
+      })
+        .sort({ createdAt: 1 })
+        .lean();
+
+      for (const r of toMove) {
+        if (remaining <= 0) break;
+        const have = Math.max(0, Math.floor(Number(r?.qty || 0)));
+        if (!have) continue;
+        const take = Math.min(have, remaining);
+        if (take <= 0) continue;
+
+        const left = have - take;
+        if (left <= 0) {
+          await PalletGroupReservation.deleteOne({ _id: r._id });
+        } else {
+          await PalletGroupReservation.updateOne({ _id: r._id }, { $set: { qty: left } });
+        }
+
+        await PalletGroupReservation.findOneAndUpdate(
+          {
+            orderNumber: String(r?.orderNumber || '').trim(),
+            warehouseId: wid,
+            sourceWarehouseId: wid,
+            groupName: g,
+            source: 'primary',
+          },
+          {
+            $inc: { qty: take },
+            $setOnInsert: { committedBy: committedBy || String(r?.committedBy || '') },
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+
+        remaining -= take;
+      }
+    };
+
     for (const it of toTransfer) {
       await PalletGroupStock.findOneAndUpdate(
         { groupName: it.groupName, warehouseId },
@@ -494,27 +558,72 @@ export const transferBatchPallets = async (req, res) => {
         committedAt: now,
         notes: 'on_process | Delivered'
       });
+
+      // Move any existing order reservations from on_process -> primary (so Orders reserved stock updates).
+      await migrateOnProcessToPrimary({ groupName: it.groupName, pallets: it.pallets });
     }
   } else {
-    // Create or upsert a Shipment of kind 'import' using PO# as reference
-    const ship = await Shipment.findOne({ kind: 'import', status: 'on_water', warehouseId, reference: poNumber });
     const noteChunks = toTransfer.map(t => `pallet-group:${t.groupName}; pallets:${t.pallets}`);
     const appended = `on-process import | ${noteChunks.join(' | ')}`;
-    if (ship) {
-      ship.notes = ship.notes ? `${ship.notes} | ${appended}` : appended;
-      if (estDeliveryDate) ship.estDeliveryDate = new Date(estDeliveryDate);
-      await ship.save();
-    } else {
-      await Shipment.create({
-        kind: 'import',
-        status: 'on_water',
-        reference: poNumber,
+    // Always create a new Shipment entry even if PO# (reference) is the same
+    await Shipment.create({
+      kind: 'import',
+      status: 'on_water',
+      reference: poNumber,
+      warehouseId,
+      estDeliveryDate: estDeliveryDate ? new Date(estDeliveryDate) : undefined,
+      items: [],
+      notes: appended,
+      createdBy: req.user?.id,
+    });
+
+    // Move existing order reservations from on_process -> on_water for this warehouse/group.
+    // Without this, Orders "Reserved Stock" will still show on_process reserved even after transfer.
+    for (const it of toTransfer) {
+      let remaining = Math.max(0, Math.floor(Number(it.pallets || 0)));
+      if (!it.groupName || !remaining) continue;
+
+      const toMove = await PalletGroupReservation.find({
         warehouseId,
-        estDeliveryDate: estDeliveryDate ? new Date(estDeliveryDate) : undefined,
-        items: [],
-        notes: appended,
-        createdBy: req.user?.id,
-      });
+        groupName: it.groupName,
+        source: 'on_process',
+        qty: { $gt: 0 },
+      })
+        .sort({ createdAt: 1 })
+        .lean();
+
+      for (const r of toMove) {
+        if (remaining <= 0) break;
+        const have = Math.max(0, Math.floor(Number(r?.qty || 0)));
+        if (!have) continue;
+        const take = Math.min(have, remaining);
+        if (take <= 0) continue;
+
+        // decrement (or delete) the on_process reservation
+        const left = have - take;
+        if (left <= 0) {
+          await PalletGroupReservation.deleteOne({ _id: r._id });
+        } else {
+          await PalletGroupReservation.updateOne({ _id: r._id }, { $set: { qty: left } });
+        }
+
+        // increment (upsert) a matching on_water reservation for the same order
+        await PalletGroupReservation.findOneAndUpdate(
+          {
+            orderNumber: String(r?.orderNumber || '').trim(),
+            warehouseId,
+            groupName: it.groupName,
+            source: 'on_water',
+          },
+          {
+            $inc: { qty: take },
+            $setOnInsert: { committedBy: committedBy || String(r?.committedBy || '') },
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+
+        remaining -= take;
+      }
     }
   }
 

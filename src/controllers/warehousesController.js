@@ -5,7 +5,7 @@ import PalletGroupStock from '../models/PalletGroupStock.js';
 export const listWarehouses = async (req, res) => {
   const q = (req.query.q || '').toString().trim().toLowerCase();
   const filter = q ? { $or: [ { name: new RegExp(q, 'i') }, { address: new RegExp(q, 'i') } ] } : {};
-  const docs = await Warehouse.find(filter).sort({ name: 1 }).lean();
+  const docs = await Warehouse.find(filter).sort({ isPrimary: -1, name: 1 }).lean();
   res.json(docs);
 };
 
@@ -14,8 +14,23 @@ export const createWarehouse = async (req, res) => {
   if (!name) return res.status(400).json({ message: 'name required' });
   const exists = await Warehouse.findOne({ name });
   if (exists) return res.status(409).json({ message: 'Warehouse already exists' });
-  const doc = await Warehouse.create({ name, address: address || '' });
+  const hasPrimary = await Warehouse.exists({ isPrimary: true });
+  const doc = await Warehouse.create({ name, address: address || '', isPrimary: !hasPrimary });
   res.status(201).json(doc);
+};
+
+export const setPrimaryWarehouse = async (req, res) => {
+  const { id } = req.params;
+  const wh = await Warehouse.findById(id);
+  if (!wh) return res.status(404).json({ message: 'Not found' });
+
+  await Warehouse.updateMany({ isPrimary: true, _id: { $ne: wh._id } }, { $set: { isPrimary: false } });
+  if (!wh.isPrimary) {
+    wh.isPrimary = true;
+    await wh.save();
+  }
+
+  res.json({ ok: true, primaryWarehouseId: String(wh._id) });
 };
 
 export const updateWarehouse = async (req, res) => {

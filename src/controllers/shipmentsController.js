@@ -1,7 +1,10 @@
 import Shipment from '../models/Shipment.js';
 import OnProcessPallet from '../models/OnProcessPallet.js';
+import ItemGroup from '../models/ItemGroup.js';
 import PalletGroupStock from '../models/PalletGroupStock.js';
 import PalletGroupTxn from '../models/PalletGroupTxn.js';
+import PalletGroupReservation from '../models/PalletGroupReservation.js';
+import UnfulfilledOrder from '../models/UnfulfilledOrder.js';
 import WarehouseStock from '../models/WarehouseStock.js';
 import Item from '../models/Item.js';
 import StockMovement from '../models/StockMovement.js';
@@ -13,6 +16,9 @@ export const listShipments = async (req, res) => {
   const q = {};
   if (status) q.status = status;
 
+  const escapeRegExp = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const toWsRegex = (s) => escapeRegExp(String(s || '').trim().replace(/\s+/g, ' ')).replace(/ /g, '\\s+');
+
   const legacyQ = (req.query.q || '').toString().trim();
   const qRef = (req.query.qRef || '').toString().trim();
   const qPallet = (req.query.qPallet || '').toString().trim();
@@ -23,7 +29,7 @@ export const listShipments = async (req, res) => {
 
   const refText = qRef || legacyQ;
   if (refText) {
-    const regex = { $regex: refText, $options: 'i' };
+    const regex = { $regex: toWsRegex(refText), $options: 'i' };
     and.push({
       $or: [
         { owNumber: regex },
@@ -33,11 +39,11 @@ export const listShipments = async (req, res) => {
   }
 
   if (qPallet) {
-    const regex = { $regex: qPallet, $options: 'i' };
+    const regex = { $regex: toWsRegex(qPallet), $options: 'i' };
     and.push({ $or: [{ notes: regex }, { 'items.itemCode': regex }] });
   } else if (legacyQ && !qRef) {
     // legacy behavior: q also searches pallet/notes + item codes when qRef isn't used
-    const regex = { $regex: legacyQ, $options: 'i' };
+    const regex = { $regex: toWsRegex(legacyQ), $options: 'i' };
     and.push({ $or: [{ notes: regex }, { 'items.itemCode': regex }] });
   }
 
@@ -84,6 +90,16 @@ export const dueToday = async (req, res) => {
     console.error('shipments.dueToday failed', e);
     res.status(500).json({ message: 'Failed to load shipments due today' });
   }
+};
+
+export const getShipmentById = async (req, res) => {
+  const { id } = req.params;
+  const doc = await Shipment.findById(id)
+    .populate('warehouseId', 'name')
+    .populate('sourceWarehouseId', 'name')
+    .lean();
+  if (!doc) return res.status(404).json({ message: 'shipment not found' });
+  res.json(doc);
 };
 
 export const createTransfer = async (req, res) => {
@@ -166,6 +182,92 @@ export const createPalletTransfer = async (req, res) => {
   if (!poNumber) return res.status(400).json({ message: 'PO# (reference) is required' });
   if (!Array.isArray(pallets) || pallets.length === 0) return res.status(400).json({ message: 'pallets required' });
 
+  const committedBy = String(req.user?.username || req.user?.id || '').trim();
+  const migrateSecondToOnWater = async ({ destWarehouseId, srcWarehouseId, groupName, pallets }) => {
+    const dest = String(destWarehouseId || '').trim();
+    const src = String(srcWarehouseId || '').trim();
+    const g = String(groupName || '').trim();
+    let remaining = Math.max(0, Math.floor(Number(pallets || 0)));
+    if (!dest || !src || !g || !remaining) return;
+
+    const toMove = await PalletGroupReservation.find({
+      warehouseId: dest,
+      sourceWarehouseId: src,
+      groupName: g,
+      source: 'second',
+      qty: { $gt: 0 },
+    })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    for (const r of toMove) {
+      if (remaining <= 0) break;
+      const have = Math.max(0, Math.floor(Number(r?.qty || 0)));
+      if (!have) continue;
+      const take = Math.min(have, remaining);
+      if (take <= 0) continue;
+
+      const orderNumber = String(r?.orderNumber || '').trim();
+
+      const left = have - take;
+      if (left <= 0) {
+        await PalletGroupReservation.deleteOne({ _id: r._id });
+      } else {
+        await PalletGroupReservation.updateOne({ _id: r._id }, { $set: { qty: left } });
+      }
+
+      await PalletGroupReservation.findOneAndUpdate(
+        {
+          orderNumber,
+          warehouseId: dest,
+          groupName: g,
+          source: 'on_water',
+        },
+        {
+          $inc: { qty: take },
+          $setOnInsert: { committedBy: committedBy || String(r?.committedBy || '') },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+
+      // Best-effort: keep allocations in sync so shipdate suggestion and UI sources match.
+      try {
+        const ord = await UnfulfilledOrder.findOne({ orderNumber }).select('status allocations warehouseId').lean();
+        const st = String(ord?.status || '').trim().toLowerCase();
+        const ordWid = String(ord?.warehouseId || '').trim();
+        if (st === 'processing' && ordWid === dest) {
+          const allocs = Array.isArray(ord?.allocations) ? ord.allocations.map((a) => ({ ...a })) : [];
+
+          let dec = take;
+          for (const a of allocs) {
+            if (dec <= 0) break;
+            if (String(a?.groupName || '').trim() !== g) continue;
+            if (String(a?.source || '').trim() !== 'second') continue;
+            if (String(a?.warehouseId || '').trim() !== src) continue;
+            const q = Math.floor(Number(a?.qty || 0));
+            if (!Number.isFinite(q) || q <= 0) continue;
+            const t2 = Math.min(q, dec);
+            a.qty = q - t2;
+            dec -= t2;
+          }
+
+          const ow = allocs.find((a) => String(a?.groupName || '').trim() === g && String(a?.source || '').trim() === 'on_water');
+          if (ow) ow.qty = Math.floor(Number(ow.qty || 0) + take);
+          else allocs.push({ groupName: g, qty: take, source: 'on_water' });
+
+          const cleaned = allocs
+            .map((a) => ({ ...a, qty: Math.floor(Number(a?.qty || 0)) }))
+            .filter((a) => String(a?.groupName || '').trim() && Number.isFinite(a?.qty) && a.qty > 0);
+          await UnfulfilledOrder.updateOne({ orderNumber }, { $set: { allocations: cleaned } });
+        }
+      } catch {
+        // ignore
+      }
+
+      remaining -= take;
+    }
+  };
+
   // validate availability
   const cleaned = pallets
     .map((p) => ({ groupName: String(p.groupName || '').trim(), pallets: Number(p.pallets) }))
@@ -199,6 +301,9 @@ export const createPalletTransfer = async (req, res) => {
       committedAt: now,
       committedBy: 'transfer',
     });
+
+    // If these pallets were reserved from a 2nd warehouse for PROCESSING orders, move reservations second -> on_water FIFO.
+    await migrateSecondToOnWater({ destWarehouseId: warehouseId, srcWarehouseId: sourceWarehouseId, groupName: p.groupName, pallets: p.pallets });
   }
 
   // store pallet list in notes for export + delivery processing
@@ -237,6 +342,78 @@ export const deliverShipment = async (req, res) => {
   if (eddDateOnly.getTime() > startOfToday.getTime()) {
     return res.status(400).json({ message: 'EDD cannot be in the future' });
   }
+
+  const committedBy = String(req.user?.username || req.user?.id || '').trim();
+
+  const keyOf = (v) =>
+    String(v || '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+
+  let resolveToGroupName = (raw) => String(raw || '').trim();
+  try {
+    const groups = await ItemGroup.find({ active: true }).select('name lineItem').lean();
+    const byGroupKey = new Map((groups || []).map((g) => [keyOf(g?.name || ''), String(g?.name || '').trim()]));
+    const byLineItemKey = new Map((groups || []).map((g) => [keyOf(g?.lineItem || ''), String(g?.name || '').trim()]));
+    resolveToGroupName = (raw) => {
+      const s = String(raw || '').trim();
+      if (!s) return '';
+      const k = keyOf(s);
+      return byGroupKey.get(k) || byLineItemKey.get(k) || s;
+    };
+  } catch {
+    // best-effort
+  }
+
+  const migrateOnWaterToPrimary = async ({ warehouseId, groupName, pallets }) => {
+    const wid = String(warehouseId || '').trim();
+    const g = String(groupName || '').trim();
+    let remaining = Math.max(0, Math.floor(Number(pallets || 0)));
+    if (!wid || !g || !remaining) return;
+
+    const toMove = await PalletGroupReservation.find({
+      warehouseId: wid,
+      groupName: g,
+      source: 'on_water',
+      qty: { $gt: 0 },
+    })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    for (const r of toMove) {
+      if (remaining <= 0) break;
+      const have = Math.max(0, Math.floor(Number(r?.qty || 0)));
+      if (!have) continue;
+      const take = Math.min(have, remaining);
+      if (take <= 0) continue;
+
+      const left = have - take;
+      if (left <= 0) {
+        await PalletGroupReservation.deleteOne({ _id: r._id });
+      } else {
+        await PalletGroupReservation.updateOne({ _id: r._id }, { $set: { qty: left } });
+      }
+
+      await PalletGroupReservation.findOneAndUpdate(
+        {
+          orderNumber: String(r?.orderNumber || '').trim(),
+          warehouseId: wid,
+          sourceWarehouseId: wid,
+          groupName: g,
+          source: 'primary',
+        },
+        {
+          $inc: { qty: take },
+          $setOnInsert: { committedBy: committedBy || String(r?.committedBy || '') },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+
+      remaining -= take;
+    }
+  };
 
   // apply to destination warehouse (legacy item transfers + imports)
   for (const it of ship.items) {
@@ -277,7 +454,7 @@ export const deliverShipment = async (req, res) => {
     let match;
     const now = new Date();
     while ((match = re.exec(noteText)) !== null) {
-      const groupName = String(match[1] || '').trim();
+      const groupName = resolveToGroupName(String(match[1] || '').trim());
       const pallets = Number(match[2] || 0);
       if (!groupName || !Number.isFinite(pallets) || pallets <= 0) continue;
       // increment pallet stock for this warehouse
@@ -296,6 +473,7 @@ export const deliverShipment = async (req, res) => {
         wasOnWater: true,
         committedAt: now,
       });
+      await migrateOnWaterToPrimary({ warehouseId: ship.warehouseId, groupName, pallets });
       // lock matching on-process pallets for this PO/group that are fully completed
       await OnProcessPallet.updateMany(
         { poNumber: ship.reference, groupName, status: 'completed', locked: { $ne: true } },
@@ -311,7 +489,7 @@ export const deliverShipment = async (req, res) => {
       let match;
       const now = new Date();
       while ((match = re.exec(noteText)) !== null) {
-        const groupName = String(match[1] || '').trim();
+        const groupName = resolveToGroupName(String(match[1] || '').trim());
         const pallets = Number(match[2] || 0);
         if (!groupName || !Number.isFinite(pallets) || pallets <= 0) continue;
         await PalletGroupStock.findOneAndUpdate(
@@ -329,6 +507,7 @@ export const deliverShipment = async (req, res) => {
           committedAt: now,
           committedBy: 'transfer',
         });
+        await migrateOnWaterToPrimary({ warehouseId: ship.warehouseId, groupName, pallets });
       }
     } else {
       // legacy item-stock transfer behavior
