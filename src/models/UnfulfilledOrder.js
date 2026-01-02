@@ -29,10 +29,12 @@ const unfulfilledOrderSchema = new mongoose.Schema(
     customerPhone: { type: String, trim: true },
     createdAtOrder: { type: Date },
     estFulfillmentDate: { type: Date },
+    estDeliveredDate: { type: Date },
     shippingAddress: { type: String, trim: true },
+    notes: { type: String, trim: true },
     lines: { type: [unfulfilledOrderLineSchema], default: [] },
     allocations: { type: [unfulfilledOrderAllocationSchema], default: [] },
-    status: { type: String, enum: ['processing','shipped','delivered','completed','canceled','create','backorder','fulfilled','cancel','created','cancelled'], default: 'processing' },
+    status: { type: String, enum: ['processing','ready_to_ship','shipped','delivered','completed','canceled','create','backorder','fulfilled','cancel','created','cancelled'], default: 'processing' },
     committedBy: { type: String, default: '' },
   },
   { timestamps: true }

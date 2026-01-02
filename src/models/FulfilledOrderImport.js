@@ -24,7 +24,7 @@ const fulfilledOrderImportSchema = new mongoose.Schema(
     warehouseId: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse', required: true, index: true },
     lines: { type: [fulfilledOrderLineSchema], default: [] },
     source: { type: String, enum: ['csv', 'manual'], required: true },
-    status: { type: String, enum: ['processing','shipped','delivered','completed','canceled','create','backorder','fulfilled','cancel','created','cancelled'], default: 'completed' },
+    status: { type: String, enum: ['processing','ready_to_ship','shipped','delivered','completed','canceled','create','backorder','fulfilled','cancel','created','cancelled'], default: 'completed' },
     committedBy: { type: String, default: '' },
   },
   { timestamps: true }

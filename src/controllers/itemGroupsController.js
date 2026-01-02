@@ -54,6 +54,20 @@ export const importItemGroups = async (req, res) => {
     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
     if (!rows.length) return res.status(400).json({ message: 'Empty worksheet' });
 
+    const expectedHeader = ['Pallet Description', 'Pallet ID', 'Item Code', 'Item Description', 'Color', 'Pack Size'];
+    const normHeader = (h) => String(h || '').trim().toLowerCase();
+    const receivedHeader = Array.isArray(rows[0]) ? rows[0].map(normHeader) : [];
+    const expectedHeaderNorm = expectedHeader.map(normHeader);
+    const headerMatches = receivedHeader.length === expectedHeaderNorm.length
+      && expectedHeaderNorm.every((h, i) => receivedHeader[i] === h);
+    if (!headerMatches) {
+      return res.status(400).json({
+        message: 'Invalid template. Column headers must match the template exactly.',
+        expectedHeader,
+        receivedHeader: Array.isArray(rows[0]) ? rows[0].map((h) => String(h ?? '')) : []
+      });
+    }
+
     // Determine the index of the group name column, optional line item column, and optional item count column.
     const header = rows[0].map((h) => String(h).trim().toLowerCase());
     let nameIdx = header.findIndex((h) => ['group name', 'name', 'item group', 'itemgroup', 'pallet group', 'palletgroup', 'pallet description', 'palletdescription', 'description'].includes(h));

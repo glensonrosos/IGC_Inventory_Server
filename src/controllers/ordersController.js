@@ -29,9 +29,28 @@ const fmtDateYmd = (d) => {
 const NO_STOCKS_MESSAGE = 'NO Stocks available, please Produce Product from the On-Process Page';
 
 const getSecondWarehouseFor = async (warehouseId) => {
-  const list = await Warehouse.find({}).select('name').sort({ name: 1 }).lean();
   const wid = String(warehouseId || '').trim();
-  const found = (list || []).find((w) => String(w?._id || '').trim() && String(w?._id || '').trim() !== wid) || null;
+  if (!wid) return null;
+
+  const current = await Warehouse.findById(wid).select('name isPrimary').lean();
+  if (!current) return null;
+
+  // Preferred pairing:
+  // - If current is primary => choose a non-primary warehouse (e.g., PEBA)
+  // - If current is non-primary => choose the primary warehouse
+  let found = null;
+  if (current.isPrimary) {
+    found = await Warehouse.findOne({ isPrimary: { $ne: true } }).select('name').sort({ name: 1 }).lean();
+  } else {
+    found = await Warehouse.findOne({ isPrimary: true }).select('name').lean();
+  }
+
+  // Fallback (legacy): pick any other warehouse
+  if (!found) {
+    const list = await Warehouse.find({}).select('name').sort({ name: 1 }).lean();
+    found = (list || []).find((w) => String(w?._id || '').trim() && String(w?._id || '').trim() !== wid) || null;
+  }
+
   return found ? { _id: String(found._id), name: String(found.name || '').trim() } : null;
 };
 
@@ -78,9 +97,12 @@ const getReservationMaps = async ({ warehouseId }) => {
 };
 
 const buildOnWaterMapForWarehouse = async ({ warehouseId, resolveToGroupName }) => {
+  const secondWarehouse = await getSecondWarehouseFor(warehouseId);
+  const whIds = [String(warehouseId || '').trim(), String(secondWarehouse?._id || '').trim()].filter((v) => v);
+
   const ships = await Shipment.find({
     status: 'on_water',
-    $or: [{ warehouseId }, { sourceWarehouseId: warehouseId }],
+    warehouseId: { $in: whIds },
     notes: { $regex: 'pallet-group:', $options: 'i' },
   })
     .select('notes')
@@ -117,6 +139,232 @@ const buildOnProcessMap = async ({ resolveToGroupName }) => {
     map.set(groupName, pallets);
   }
   return map;
+};
+
+const rebalanceProcessingOrderAllocations = async ({ order, resolveToGroupName }) => {
+  const status = normalizeOrderStatus(order?.status || 'processing') || 'processing';
+  if (status !== 'processing' || !order?._id || !order?.warehouseId || !order?.orderNumber) return false;
+
+  const primaryWarehouseId = String(order.warehouseId);
+  const secondWarehouse = await getSecondWarehouseFor(primaryWarehouseId);
+  if (!secondWarehouse?._id) return false;
+
+  const wh2 = String(secondWarehouse._id);
+  const orderNumber = String(order.orderNumber || '').trim();
+
+  const reservation = await getReservationMaps({ warehouseId: primaryWarehouseId });
+  const onWaterMap = await buildOnWaterMapForWarehouse({ warehouseId: primaryWarehouseId, resolveToGroupName });
+
+  const reservedOnWaterTotals = new Map(reservation.onWater);
+  const reservedPhysicalPrimary = new Map(reservation.physicalByWarehouse?.get(primaryWarehouseId) || []);
+  const reservedPhysicalSecond = new Map(reservation.physicalByWarehouse?.get(wh2) || []);
+
+  const resDocs = await PalletGroupReservation.find({
+    orderNumber,
+    warehouseId: primaryWarehouseId,
+    qty: { $gt: 0 },
+  })
+    .select('groupName source qty sourceWarehouseId')
+    .lean();
+
+  const orderOnWater = new Map();
+  const orderOnProcess = new Map();
+  const orderSecond = new Map();
+  for (const d of resDocs || []) {
+    const groupName = String(d?.groupName || '').trim();
+    const source = String(d?.source || '').trim();
+    const qty = Math.floor(Number(d?.qty || 0));
+    const srcWid = String(d?.sourceWarehouseId || '').trim();
+    if (!groupName || !Number.isFinite(qty) || qty <= 0) continue;
+    if (source === 'on_water') orderOnWater.set(groupName, (orderOnWater.get(groupName) || 0) + qty);
+    else if (source === 'on_process') orderOnProcess.set(groupName, (orderOnProcess.get(groupName) || 0) + qty);
+    else if (source === 'second' && srcWid === wh2) orderSecond.set(groupName, (orderSecond.get(groupName) || 0) + qty);
+  }
+
+  const nextAllocs = Array.isArray(order.allocations) ? order.allocations.map((a) => ({ ...a })) : [];
+  const addAlloc = (groupName, qty, source, warehouseId) => {
+    const g = String(groupName || '').trim();
+    const q = Math.floor(Number(qty || 0));
+    if (!g || !Number.isFinite(q) || q <= 0) return;
+    const found = nextAllocs.find((a) => String(a?.groupName || '').trim() === g && String(a?.source || '').trim() === source && (warehouseId ? String(a?.warehouseId || '').trim() === String(warehouseId) : !a?.warehouseId));
+    if (found) found.qty = Math.floor(Number(found.qty || 0) + q);
+    else {
+      const row = { groupName: g, qty: q, source };
+      if (warehouseId) row.warehouseId = String(warehouseId);
+      nextAllocs.push(row);
+    }
+  };
+  const decAlloc = (groupName, qty, source, warehouseId) => {
+    const g = String(groupName || '').trim();
+    let remaining = Math.floor(Number(qty || 0));
+    if (!g || !Number.isFinite(remaining) || remaining <= 0) return;
+    for (const a of nextAllocs) {
+      if (remaining <= 0) break;
+      if (String(a?.groupName || '').trim() !== g) continue;
+      if (String(a?.source || '').trim() !== source) continue;
+      if (warehouseId) {
+        if (String(a?.warehouseId || '').trim() !== String(warehouseId)) continue;
+      } else if (a?.warehouseId) {
+        continue;
+      }
+      const have = Math.floor(Number(a?.qty || 0));
+      if (!Number.isFinite(have) || have <= 0) continue;
+      const take = Math.min(have, remaining);
+      a.qty = have - take;
+      remaining -= take;
+    }
+  };
+
+  const decReservation = async ({ groupName, source, qty, sourceWarehouseId }) => {
+    const q = Math.floor(Number(qty || 0));
+    if (!q || q <= 0) return;
+    const query = { orderNumber, warehouseId: primaryWarehouseId, groupName, source };
+    if (sourceWarehouseId) query.sourceWarehouseId = String(sourceWarehouseId);
+    await PalletGroupReservation.findOneAndUpdate(query, { $inc: { qty: -q } });
+    await PalletGroupReservation.deleteMany({ ...query, qty: { $lte: 0 } });
+  };
+  const incReservation = async ({ groupName, source, qty, sourceWarehouseId }) => {
+    const q = Math.floor(Number(qty || 0));
+    if (!q || q <= 0) return;
+    const query = { orderNumber, warehouseId: primaryWarehouseId, groupName, source };
+    if (sourceWarehouseId) query.sourceWarehouseId = String(sourceWarehouseId);
+    await PalletGroupReservation.findOneAndUpdate(
+      query,
+      { $inc: { qty: q }, $setOnInsert: { committedBy: '' } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+  };
+
+  let moved = false;
+  const groups = new Set([...Array.from(orderOnWater.keys()), ...Array.from(orderSecond.keys()), ...Array.from(orderOnProcess.keys())]);
+  for (const groupName of groups) {
+    const g = String(groupName || '').trim();
+    if (!g) continue;
+
+    // 1) on-water -> primary
+    const ow = Math.max(0, Number(orderOnWater.get(g) || 0));
+    if (ow > 0) {
+      const stockDoc = await PalletGroupStock.findOne({ warehouseId: primaryWarehouseId, groupName: g }).select('pallets').lean();
+      const total = Math.max(0, Number(stockDoc?.pallets || 0));
+      const reserved = Math.max(0, Number(reservedPhysicalPrimary.get(g) || 0));
+      const avail = Math.max(0, total - reserved);
+      const take = Math.min(ow, avail);
+      if (take > 0) {
+        await decReservation({ groupName: g, source: 'on_water', qty: take });
+        await incReservation({ groupName: g, source: 'primary', qty: take, sourceWarehouseId: primaryWarehouseId });
+        decAlloc(g, take, 'on_water');
+        addAlloc(g, take, 'primary', primaryWarehouseId);
+
+        orderOnWater.set(g, ow - take);
+        reservedOnWaterTotals.set(g, Math.max(0, Number(reservedOnWaterTotals.get(g) || 0) - take));
+        reservedPhysicalPrimary.set(g, reserved + take);
+        moved = true;
+      }
+    }
+
+    // 2) second -> on-water
+    const sec = Math.max(0, Number(orderSecond.get(g) || 0));
+    if (sec > 0) {
+      const onWaterTotal = Math.max(0, Number(onWaterMap.get(g) || 0));
+      const onWaterReserved = Math.max(0, Number(reservedOnWaterTotals.get(g) || 0));
+      const onWaterAvail = Math.max(0, onWaterTotal - onWaterReserved);
+      const take = Math.min(sec, onWaterAvail);
+      if (take > 0) {
+        await decReservation({ groupName: g, source: 'second', qty: take, sourceWarehouseId: wh2 });
+        await incReservation({ groupName: g, source: 'on_water', qty: take });
+        decAlloc(g, take, 'second', wh2);
+        addAlloc(g, take, 'on_water');
+
+        orderSecond.set(g, sec - take);
+        reservedPhysicalSecond.set(g, Math.max(0, Number(reservedPhysicalSecond.get(g) || 0) - take));
+        reservedOnWaterTotals.set(g, onWaterReserved + take);
+        moved = true;
+      }
+    }
+
+    // 3) on-process -> second
+    const op = Math.max(0, Number(orderOnProcess.get(g) || 0));
+    if (op > 0) {
+      const stockDoc = await PalletGroupStock.findOne({ warehouseId: wh2, groupName: g }).select('pallets').lean();
+      const total = Math.max(0, Number(stockDoc?.pallets || 0));
+      const reserved = Math.max(0, Number(reservedPhysicalSecond.get(g) || 0));
+      const avail = Math.max(0, total - reserved);
+      const take = Math.min(op, avail);
+      if (take > 0) {
+        await decReservation({ groupName: g, source: 'on_process', qty: take });
+        await incReservation({ groupName: g, source: 'second', qty: take, sourceWarehouseId: wh2 });
+        decAlloc(g, take, 'on_process');
+        addAlloc(g, take, 'second', wh2);
+
+        orderOnProcess.set(g, op - take);
+        reservedPhysicalSecond.set(g, reserved + take);
+        moved = true;
+      }
+    }
+  }
+
+  const isFullyPrimaryNow = () => {
+    for (const v of Array.from(orderOnWater.values())) if (Number(v || 0) > 0) return false;
+    for (const v of Array.from(orderOnProcess.values())) if (Number(v || 0) > 0) return false;
+    for (const v of Array.from(orderSecond.values())) if (Number(v || 0) > 0) return false;
+    return true;
+  };
+
+  // If the order is already fully primary, update status to READY TO SHIP (even if no movement happened)
+  if (!moved && isFullyPrimaryNow()) {
+    let primaryDoneAt = null;
+    try {
+      const latest = await PalletGroupReservation.findOne({ orderNumber, warehouseId: primaryWarehouseId, source: 'primary', qty: { $gt: 0 } })
+        .sort({ updatedAt: -1 })
+        .select('updatedAt')
+        .lean();
+      if (latest?.updatedAt) {
+        const dt = new Date(latest.updatedAt);
+        if (!Number.isNaN(dt.getTime())) primaryDoneAt = dt;
+      }
+    } catch {
+      primaryDoneAt = null;
+    }
+
+    await UnfulfilledOrder.updateOne(
+      { _id: order._id },
+      {
+        $set: {
+          status: 'ready_to_ship',
+          ...(primaryDoneAt ? { estFulfillmentDate: primaryDoneAt } : {}),
+        },
+      }
+    );
+    return true;
+  }
+
+  if (!moved) return false;
+
+  const cleanedAllocs = nextAllocs
+    .map((a) => ({ ...a, qty: Math.floor(Number(a?.qty || 0)) }))
+    .filter((a) => String(a?.groupName || '').trim() && Number.isFinite(a?.qty) && a.qty > 0);
+
+  const nextUpdate = { allocations: cleanedAllocs };
+  if (isFullyPrimaryNow()) {
+    let primaryDoneAt = null;
+    try {
+      const latest = await PalletGroupReservation.findOne({ orderNumber, warehouseId: primaryWarehouseId, source: 'primary', qty: { $gt: 0 } })
+        .sort({ updatedAt: -1 })
+        .select('updatedAt')
+        .lean();
+      if (latest?.updatedAt) {
+        const dt = new Date(latest.updatedAt);
+        if (!Number.isNaN(dt.getTime())) primaryDoneAt = dt;
+      }
+    } catch {
+      primaryDoneAt = null;
+    }
+    nextUpdate.status = 'ready_to_ship';
+    if (primaryDoneAt) nextUpdate.estFulfillmentDate = primaryDoneAt;
+  }
+
+  await UnfulfilledOrder.updateOne({ _id: order._id }, { $set: nextUpdate });
+  return true;
 };
 
 const normalizeHeaderKey = (v) =>
@@ -203,6 +451,9 @@ export const onWaterDetails = async (req, res) => {
     if (!warehouseId) return res.status(400).json({ message: 'warehouseId required' });
     if (!groupNameRaw) return res.status(400).json({ message: 'groupName required' });
 
+    const secondWarehouse = await getSecondWarehouseFor(warehouseId);
+    const whIds = [String(warehouseId || '').trim(), String(secondWarehouse?._id || '').trim()].filter((v) => v);
+
     const keyOf = (v) =>
       normalizeStr(v)
         .replace(/\u00a0/g, ' ')
@@ -212,7 +463,7 @@ export const onWaterDetails = async (req, res) => {
 
     const ships = await Shipment.find({
       status: 'on_water',
-      $or: [{ warehouseId }, { sourceWarehouseId: warehouseId }],
+      warehouseId: { $in: whIds },
       notes: { $regex: 'pallet-group:', $options: 'i' },
     })
       .select('owNumber reference estDeliveryDate notes createdAt')
@@ -505,6 +756,8 @@ const normalizeOrderStatus = (v) => {
   // legacy aliases
   if (s === 'created') return 'processing';
   if (s === 'create') return 'processing';
+  if (s === 'ready-to-ship') return 'ready_to_ship';
+  if (s === 'ready to ship') return 'ready_to_ship';
   if (s === 'fulfilled') return 'completed';
   if (s === 'cancelled') return 'canceled';
   if (s === 'cancel') return 'canceled';
@@ -513,7 +766,7 @@ const normalizeOrderStatus = (v) => {
   return s;
 };
 
-const ORDER_STATUSES = ['processing', 'shipped', 'delivered', 'completed', 'canceled'];
+const ORDER_STATUSES = ['processing', 'ready_to_ship', 'shipped', 'delivered', 'completed', 'canceled'];
 
 const isInventoryConsumingStatus = (s) => {
   const v = normalizeOrderStatus(s);
@@ -619,7 +872,7 @@ const applyFulfilledOrder = async ({ warehouseId, orderNumber, meta, lines, comm
 };
 
 export const createUnfulfilledOrder = async (req, res) => {
-  const { warehouseId, customerEmail, customerName, customerPhone, createdAtOrder, estFulfillmentDate, shippingAddress, lines = [], status } = req.body || {};
+  const { warehouseId, customerEmail, customerName, customerPhone, createdAtOrder, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines = [], status } = req.body || {};
   if (!warehouseId) return res.status(400).json({ message: 'warehouseId required' });
   if (!Array.isArray(lines) || lines.length === 0) return res.status(400).json({ message: 'lines required' });
   if (!normalizeStr(customerPhone)) return res.status(400).json({ message: 'customerPhone required' });
@@ -738,7 +991,7 @@ export const createUnfulfilledOrder = async (req, res) => {
     }
 
     if (remaining > 0) {
-      return res.status(400).json({ message: NO_STOCKS_MESSAGE });
+      return res.status(400).json({ message: `${NO_STOCKS_MESSAGE} (Pallet Description: ${groupName})` });
     }
   }
 
@@ -769,7 +1022,9 @@ export const createUnfulfilledOrder = async (req, res) => {
     customerPhone: normalizeStr(customerPhone),
     createdAtOrder: createdAtOrder ? new Date(createdAtOrder) : new Date(),
     estFulfillmentDate: estFulfillmentDate ? new Date(estFulfillmentDate) : undefined,
+    estDeliveredDate: nextStatus === 'shipped' && normalizeStr(estDeliveredDate) ? new Date(normalizeStr(estDeliveredDate)) : undefined,
     shippingAddress: normalizeStr(shippingAddress),
+    notes: normalizeStr(notes),
     lines: parsedLines,
     allocations,
     status: nextStatus,
@@ -826,10 +1081,13 @@ export const palletPicker = async (req, res) => {
 
     const reserved = await getReservationMaps({ warehouseId });
 
+    const secondWarehouse = await getSecondWarehouseFor(warehouseId);
+    const onWaterWhIds = [String(warehouseId || '').trim(), String(secondWarehouse?._id || '').trim()].filter((v) => v);
+
     // On-water per group for the selected warehouse: sum pallets + latest EDD
     const ships = await Shipment.find({
       status: 'on_water',
-      $or: [{ warehouseId }, { sourceWarehouseId: warehouseId }],
+      warehouseId: { $in: onWaterWhIds },
       notes: { $regex: 'pallet-group:', $options: 'i' },
     })
       .select('notes estDeliveryDate')
@@ -962,6 +1220,38 @@ export const palletPicker = async (req, res) => {
           const resolved = resolveToGroupName(debugGroupNameRaw);
           const rk = keyOf(resolved);
           const row = rows.find((r) => keyOf(r.groupName) === rk) || null;
+
+          let debugOnWaterTotal = 0;
+          const debugOnWaterShips = [];
+          try {
+            for (const s of ships || []) {
+              const text = String(s?.notes || '');
+              re.lastIndex = 0;
+              let m;
+              let qty = 0;
+              while ((m = re.exec(text)) !== null) {
+                const groupName = resolveToGroupName(String(m[1] || '').trim());
+                const groupKey = keyOf(groupName);
+                if (!groupKey || groupKey !== rk) continue;
+                const pallets = Number(m[2] || 0);
+                if (!Number.isFinite(pallets) || pallets <= 0) continue;
+                qty += pallets;
+              }
+              if (qty <= 0) continue;
+              debugOnWaterTotal += qty;
+              debugOnWaterShips.push({
+                id: String(s?._id || ''),
+                warehouseId: String(s?.warehouseId || ''),
+                reference: String(s?.reference || ''),
+                estDeliveryDate: fmtDateYmd(s?.estDeliveryDate || null) || '',
+                qty,
+                notes: String(s?.notes || ''),
+              });
+            }
+          } catch {
+            // ignore
+          }
+
           return {
             debugGroupName: debugGroupNameRaw,
             debugKey: k,
@@ -974,6 +1264,9 @@ export const palletPicker = async (req, res) => {
               warehouseId: String(s?._id?.warehouseId || ''),
               pallets: Number(s?.pallets || 0),
             })),
+            onWaterWarehouseIdsScanned: onWaterWhIds,
+            onWaterParsedTotal: debugOnWaterTotal,
+            onWaterMatchedShipments: debugOnWaterShips,
           };
         })()
       : undefined;
@@ -1023,7 +1316,7 @@ export const listUnfulfilledOrders = async (req, res) => {
   if (whIds.length) {
     const ships = await Shipment.find({
       status: 'on_water',
-      $or: [{ warehouseId: { $in: whIds } }, { sourceWarehouseId: { $in: whIds } }],
+      warehouseId: { $in: whIds },
       notes: { $regex: 'pallet-group:', $options: 'i' },
     })
       .select('notes estDeliveryDate warehouseId sourceWarehouseId')
@@ -1034,12 +1327,8 @@ export const listUnfulfilledOrders = async (req, res) => {
       const d = s?.estDeliveryDate ? new Date(s.estDeliveryDate) : null;
       if (!d || Number.isNaN(d.getTime())) continue;
 
-      const candidateWids = [];
-      const w1 = String(s?.warehouseId || '').trim();
-      const w2 = String(s?.sourceWarehouseId || '').trim();
-      if (w1 && whIds.includes(w1)) candidateWids.push(w1);
-      if (w2 && whIds.includes(w2)) candidateWids.push(w2);
-      if (!candidateWids.length) continue;
+      const wid = String(s?.warehouseId || '').trim();
+      if (!wid || !whIds.includes(wid)) continue;
 
       const text = String(s?.notes || '');
       re.lastIndex = 0;
@@ -1049,12 +1338,10 @@ export const listUnfulfilledOrders = async (req, res) => {
         const pallets = Number(m[2] || 0);
         if (!groupKey || !Number.isFinite(pallets) || pallets <= 0) continue;
 
-        for (const wid of candidateWids) {
-          if (!onWaterEddByWarehouse.has(wid)) onWaterEddByWarehouse.set(wid, new Map());
-          const mm = onWaterEddByWarehouse.get(wid);
-          const prev = mm.get(groupKey);
-          if (!prev || d.getTime() > prev.getTime()) mm.set(groupKey, d);
-        }
+        if (!onWaterEddByWarehouse.has(wid)) onWaterEddByWarehouse.set(wid, new Map());
+        const mm = onWaterEddByWarehouse.get(wid);
+        const prev = mm.get(groupKey);
+        if (!prev || d.getTime() > prev.getTime()) mm.set(groupKey, d);
       }
     }
   }
@@ -1086,40 +1373,101 @@ export const listUnfulfilledOrders = async (req, res) => {
     // ignore
   }
 
+  // Build reservation-based view per order so shipdate is derived from actual reserved tiers (not allocations).
+  const reservationByOrder = new Map();
+  try {
+    const processingOrders = (docs || []).filter((d) => {
+      const s = normalizeOrderStatus(d?.status || 'processing') || 'processing';
+      return s === 'processing' || s === 'ready_to_ship';
+    });
+    const orderNumbers = Array.from(
+      new Set(
+        processingOrders
+          .map((d) => String(d?.orderNumber || '').trim())
+          .filter((v) => v)
+      )
+    );
+
+    if (orderNumbers.length && whIds.length) {
+      const resAgg = await PalletGroupReservation.aggregate([
+        { $addFields: { orderNumberStr: { $toString: '$orderNumber' }, warehouseIdStr: { $toString: '$warehouseId' } } },
+        { $match: { orderNumberStr: { $in: orderNumbers }, warehouseIdStr: { $in: whIds }, qty: { $gt: 0 } } },
+        {
+          $group: {
+            _id: { orderNumberStr: '$orderNumberStr', source: '$source', groupName: '$groupName' },
+            qty: { $sum: '$qty' },
+            maxUpdatedAt: { $max: '$updatedAt' },
+          },
+        },
+      ]);
+
+      for (const r of resAgg || []) {
+        const orderNumber = String(r?._id?.orderNumberStr || '').trim();
+        const source = String(r?._id?.source || '').trim().toLowerCase();
+        const groupKey = keyOf(String(r?._id?.groupName || '').trim());
+        const qty = Math.floor(Number(r?.qty || 0));
+        if (!orderNumber || !source || !Number.isFinite(qty) || qty <= 0) continue;
+
+        if (!reservationByOrder.has(orderNumber)) {
+          reservationByOrder.set(orderNumber, { hasSecond: false, onWaterKeys: new Set(), onProcessKeys: new Set(), primaryUpdatedAt: null });
+        }
+        const rec = reservationByOrder.get(orderNumber);
+        if (source === 'second') rec.hasSecond = true;
+        else if (source === 'on_water' && groupKey) rec.onWaterKeys.add(groupKey);
+        else if (source === 'on_process' && groupKey) rec.onProcessKeys.add(groupKey);
+        else if (source === 'primary') {
+          const dt = (r?.maxUpdatedAt ? new Date(r.maxUpdatedAt) : null);
+          if (dt && !Number.isNaN(dt.getTime())) {
+            const prev = rec.primaryUpdatedAt ? new Date(rec.primaryUpdatedAt) : null;
+            if (!prev || dt.getTime() > prev.getTime()) rec.primaryUpdatedAt = dt;
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore; fall back to existing stored estFulfillmentDate
+  }
+
   const out = (docs || []).map((d) => {
     const status = normalizeOrderStatus(d?.status || 'processing') || 'processing';
-    if (status !== 'processing') return d;
+    if (status !== 'processing' && status !== 'ready_to_ship') return d;
 
-    const allocs = Array.isArray(d?.allocations) ? d.allocations : [];
-    const hasSecond = allocs.some((a) => String(a?.source || '').trim().toLowerCase() === 'second' && Number(a?.qty || 0) > 0);
-    if (hasSecond && cutoffSecond) {
-      return { ...d, estFulfillmentDate: cutoffSecond ? new Date(`${cutoffSecond}T00:00:00`) : d.estFulfillmentDate };
-    }
+    const orderNumber = String(d?.orderNumber || '').trim();
+    const r = orderNumber && reservationByOrder.has(orderNumber) ? reservationByOrder.get(orderNumber) : { hasSecond: false, onWaterKeys: new Set(), onProcessKeys: new Set(), primaryUpdatedAt: null };
 
     const wid = String(d?.warehouseId || '').trim();
     const onWaterMap = wid && onWaterEddByWarehouse.has(wid) ? onWaterEddByWarehouse.get(wid) : null;
 
     let best = '';
-    for (const a of allocs) {
-      const gKey = keyOf(String(a?.groupName || '').trim());
-      const src = String(a?.source || '').trim().toLowerCase();
-      const qty = Math.floor(Number(a?.qty || 0));
-      if (!gKey || !Number.isFinite(qty) || qty <= 0) continue;
 
-      if (src === 'on_water') {
-        const d2 = onWaterMap ? onWaterMap.get(gKey) : null;
-        const ymd = d2 ? toYmd(d2) : '';
-        if (ymd && (!best || ymd > best)) best = ymd;
-      } else if (src === 'on_process') {
-        const d2 = onProcessEddByGroup.get(gKey) || null;
-        const base = d2 ? toYmd(d2) : '';
-        const ready = base ? addMonthsYmd(base, 3) : '';
-        if (ready && (!best || ready > best)) best = ready;
-      }
+    for (const gKey of Array.from(r?.onWaterKeys || [])) {
+      const d2 = onWaterMap ? onWaterMap.get(gKey) : null;
+      const ymd = d2 ? toYmd(d2) : '';
+      if (ymd && (!best || ymd > best)) best = ymd;
+    }
+    for (const gKey of Array.from(r?.onProcessKeys || [])) {
+      const d2 = onProcessEddByGroup.get(gKey) || null;
+      const base = d2 ? toYmd(d2) : '';
+      const ready = base ? addMonthsYmd(base, 3) : '';
+      if (ready && (!best || ready > best)) best = ready;
     }
 
-    const ymdOut = best || today;
-    return { ...d, estFulfillmentDate: ymdOut ? new Date(`${ymdOut}T00:00:00`) : d.estFulfillmentDate };
+    // If fully primary (no second/on-water/on-process), use the completion date (primary reservation last updated)
+    // and mark order READY TO SHIP; otherwise keep it PROCESSING.
+    const fullyPrimary = !r?.hasSecond && !(r?.onWaterKeys && r.onWaterKeys.size) && !(r?.onProcessKeys && r.onProcessKeys.size);
+    const primaryDone = r?.primaryUpdatedAt ? toYmd(r.primaryUpdatedAt) : '';
+    // If this order pulls from the 2nd warehouse, shipdate is at least today + 3 months.
+    // Final shipdate should be the maximum across all applicable sources.
+    let ymdOut = best || (fullyPrimary && primaryDone ? primaryDone : today);
+    if (r?.hasSecond && cutoffSecond) {
+      if (!ymdOut || cutoffSecond > ymdOut) ymdOut = cutoffSecond;
+    }
+    const derivedStatus = fullyPrimary ? 'ready_to_ship' : 'processing';
+    return {
+      ...d,
+      status: derivedStatus,
+      estFulfillmentDate: ymdOut ? new Date(`${ymdOut}T00:00:00`) : d.estFulfillmentDate,
+    };
   });
 
   res.json(out);
@@ -1188,10 +1536,6 @@ export const updateImportedOrderStatus = async (req, res) => {
 
   const prev = normalizeOrderStatus(doc.status || 'processing') || 'processing';
   if (prev === 'completed') return res.status(400).json({ message: 'Completed orders are locked' });
-
-  if (prev === 'shipped' && next === 'canceled') {
-    return res.status(400).json({ message: 'Shipped orders cannot be canceled' });
-  }
 
   const committedBy = String(req.user?.username || req.user?.id || '');
   const orderLines = (doc.lines || []).map((l) => ({ groupName: l.groupName, qty: l.qty }));
@@ -1313,7 +1657,7 @@ export const updateImportedOrderStatus = async (req, res) => {
       }
 
       if (remaining > 0) {
-        return res.status(400).json({ message: NO_STOCKS_MESSAGE });
+        return res.status(400).json({ message: `${NO_STOCKS_MESSAGE} (Pallet Description: ${groupName})` });
       }
     }
 
@@ -1341,6 +1685,9 @@ export const updateImportedOrderStatus = async (req, res) => {
 
   // shipped/delivered/completed do not change inventory (inventory already affected on processing)
   doc.status = next;
+  if (next !== 'shipped') {
+    doc.estDeliveredDate = null;
+  }
   await doc.save();
   res.json(doc.toObject());
 };
@@ -1352,98 +1699,8 @@ export const getUnfulfilledOrderById = async (req, res) => {
   if (!raw) return res.status(404).json({ message: 'Order not found' });
 
   try {
-    const status = normalizeOrderStatus(raw.status || 'processing') || 'processing';
-    if (status === 'processing' && raw?.warehouseId && raw?.orderNumber) {
-      const primaryWarehouseId = String(raw.warehouseId);
-      const secondWarehouse = await getSecondWarehouseFor(primaryWarehouseId);
-
-      if (secondWarehouse?._id) {
-        const wh2 = String(secondWarehouse._id);
-        const orderNumber = String(raw.orderNumber || '').trim();
-
-        // Compute available pallets at 2nd warehouse after existing reservations.
-        const reservation = await getReservationMaps({ warehouseId: primaryWarehouseId });
-        const onProcessDocs = await PalletGroupReservation.find({
-          orderNumber,
-          warehouseId: primaryWarehouseId,
-          source: 'on_process',
-          qty: { $gt: 0 },
-        })
-          .select('groupName qty')
-          .lean();
-
-        if (onProcessDocs.length) {
-          const updates = [];
-          const nextAllocs = Array.isArray(raw.allocations) ? raw.allocations.map((a) => ({ ...a })) : [];
-          const addOrIncSecondAlloc = (groupName, qty) => {
-            const g = String(groupName || '').trim();
-            const q = Math.floor(Number(qty || 0));
-            if (!g || !Number.isFinite(q) || q <= 0) return;
-            const found = nextAllocs.find((a) => String(a?.groupName || '').trim() === g && String(a?.source || '').trim() === 'second' && String(a?.warehouseId || '').trim() === wh2);
-            if (found) found.qty = Math.floor(Number(found.qty || 0) + q);
-            else nextAllocs.push({ groupName: g, qty: q, source: 'second', warehouseId: wh2 });
-          };
-          const decOnProcessAlloc = (groupName, qty) => {
-            const g = String(groupName || '').trim();
-            let remaining = Math.floor(Number(qty || 0));
-            if (!g || !Number.isFinite(remaining) || remaining <= 0) return;
-            for (const a of nextAllocs) {
-              if (remaining <= 0) break;
-              if (String(a?.groupName || '').trim() !== g) continue;
-              if (String(a?.source || '').trim() !== 'on_process') continue;
-              const have = Math.floor(Number(a?.qty || 0));
-              if (!Number.isFinite(have) || have <= 0) continue;
-              const take = Math.min(have, remaining);
-              a.qty = have - take;
-              remaining -= take;
-            }
-          };
-
-          for (const r of onProcessDocs) {
-            const groupName = String(r?.groupName || '').trim();
-            const reservedOnProcess = Math.floor(Number(r?.qty || 0));
-            if (!groupName || !Number.isFinite(reservedOnProcess) || reservedOnProcess <= 0) continue;
-
-            const secondStockDoc = await PalletGroupStock.findOne({ warehouseId: wh2, groupName }).select('pallets').lean();
-            const secondTotal = Math.max(0, Number(secondStockDoc?.pallets || 0));
-            const secondReserved = Math.max(0, Number(reservation.physicalByWarehouse?.get(String(wh2))?.get(groupName) || 0));
-            const secondAvail = Math.max(0, secondTotal - secondReserved);
-            const take = Math.min(secondAvail, reservedOnProcess);
-            if (take <= 0) continue;
-
-            // Move reservation qty from on_process -> second.
-            updates.push({ groupName, take });
-            addOrIncSecondAlloc(groupName, take);
-            decOnProcessAlloc(groupName, take);
-          }
-
-          if (updates.length) {
-            for (const u of updates) {
-              // decrement on_process reservation
-              await PalletGroupReservation.findOneAndUpdate(
-                { orderNumber, warehouseId: primaryWarehouseId, groupName: u.groupName, source: 'on_process' },
-                { $inc: { qty: -u.take } }
-              );
-              await PalletGroupReservation.deleteMany({ orderNumber, warehouseId: primaryWarehouseId, groupName: u.groupName, source: 'on_process', qty: { $lte: 0 } });
-
-              // upsert second reservation
-              await PalletGroupReservation.findOneAndUpdate(
-                { orderNumber, warehouseId: primaryWarehouseId, groupName: u.groupName, source: 'second', sourceWarehouseId: wh2 },
-                { $inc: { qty: u.take }, $setOnInsert: { committedBy: '' } },
-                { upsert: true, new: true, setDefaultsOnInsert: true }
-              );
-            }
-
-            // Clean allocations array (remove zeroed entries)
-            const cleanedAllocs = nextAllocs
-              .map((a) => ({ ...a, qty: Math.floor(Number(a?.qty || 0)) }))
-              .filter((a) => String(a?.groupName || '').trim() && Number.isFinite(a?.qty) && a.qty > 0);
-
-            await UnfulfilledOrder.updateOne({ _id: id }, { $set: { allocations: cleanedAllocs } });
-          }
-        }
-      }
-    }
+    const resolveToGroupName = (v) => String(v || '').trim();
+    await rebalanceProcessingOrderAllocations({ order: { ...raw, _id: id }, resolveToGroupName });
   } catch {
     // best-effort; do not block UI
   }
@@ -1490,6 +1747,41 @@ export const getUnfulfilledOrderById = async (req, res) => {
   res.json({ ...doc, reservedBreakdown });
 };
 
+export const rebalanceProcessingOrders = async (req, res) => {
+  try {
+    const keyOf = (v) =>
+      normalizeStr(v)
+        .replace(/\u00a0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .toLowerCase();
+    const groups = await ItemGroup.find({ active: true }).select('name lineItem').lean();
+    const byGroupKey = new Map((groups || []).map((g) => [keyOf(g?.name || ''), String(g?.name || '').trim()]));
+    const byLineItemKey = new Map((groups || []).map((g) => [keyOf(g?.lineItem || ''), String(g?.name || '').trim()]));
+    const resolveToGroupName = (raw) => {
+      const s = String(raw || '').trim();
+      if (!s) return '';
+      const k = keyOf(s);
+      return byGroupKey.get(k) || byLineItemKey.get(k) || s;
+    };
+
+    const rows = await UnfulfilledOrder.find({}).select('_id orderNumber warehouseId status allocations').lean();
+    let updated = 0;
+    for (const r of rows || []) {
+      try {
+        const status = normalizeOrderStatus(r?.status || 'processing') || 'processing';
+        if (status !== 'processing') continue;
+        const changed = await rebalanceProcessingOrderAllocations({ order: r, resolveToGroupName });
+        if (changed) updated += 1;
+      } catch {
+        // best-effort
+      }
+    }
+    return res.json({ ok: true, updated });
+  } catch (e) {
+    return res.status(500).json({ message: 'Failed to rebalance processing orders' });
+  }
+};
+
 export const checkUnfulfilledOrderStock = async (req, res) => {
   const { id } = req.params;
   const doc = await UnfulfilledOrder.findById(id).select('warehouseId lines').lean();
@@ -1506,7 +1798,7 @@ export const checkUnfulfilledOrderStock = async (req, res) => {
 
 export const updateUnfulfilledOrderStatus = async (req, res) => {
   const { id } = req.params;
-  const { status } = req.body || {};
+  const { status, estDeliveredDate } = req.body || {};
   const next = normalizeOrderStatus(status);
   if (!ORDER_STATUSES.includes(next)) {
     return res.status(400).json({ message: 'Invalid status' });
@@ -1517,10 +1809,6 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
 
   const prev = normalizeOrderStatus(doc.status || 'processing') || 'processing';
   if (prev === 'completed') return res.status(400).json({ message: 'Completed orders are locked' });
-
-  if (prev === 'shipped' && next === 'canceled') {
-    return res.status(400).json({ message: 'Shipped orders cannot be canceled' });
-  }
 
   const committedBy = String(req.user?.username || req.user?.id || '');
   const orderLines = (doc.lines || []).map((l) => ({ groupName: l.groupName, qty: l.qty }));
@@ -1645,7 +1933,7 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
       }
 
       if (remaining > 0) {
-        return res.status(400).json({ message: NO_STOCKS_MESSAGE });
+        return res.status(400).json({ message: `${NO_STOCKS_MESSAGE} (Pallet Description: ${groupName})` });
       }
     }
 
@@ -1669,7 +1957,11 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
     doc.allocations = allocs;
   }
 
-  if (next === 'shipped' && prev === 'processing') {
+  if (next === 'shipped' && (prev === 'processing' || prev === 'ready_to_ship')) {
+    const d = normalizeStr(estDeliveredDate);
+    if (d) {
+      doc.estDeliveredDate = new Date(d);
+    }
     // Deduct physical stock at the moment of shipping (based on planned allocations)
     const allocs = Array.isArray(doc.allocations) ? doc.allocations : [];
     const primaryMap = new Map();
@@ -1713,7 +2005,7 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
 
 export const updateUnfulfilledOrderDetails = async (req, res) => {
   const { id } = req.params;
-  const { customerName, customerEmail, customerPhone, estFulfillmentDate, shippingAddress, lines } = req.body || {};
+  const { customerName, customerEmail, customerPhone, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines } = req.body || {};
 
   const existing = await UnfulfilledOrder.findById(id).select('status warehouseId orderNumber lines').lean();
   if (!existing) return res.status(404).json({ message: 'Order not found' });
@@ -1724,15 +2016,20 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
   if (customerEmail !== undefined) set.customerEmail = normalizeStr(customerEmail);
   if (customerPhone !== undefined) set.customerPhone = normalizeStr(customerPhone);
   if (shippingAddress !== undefined) set.shippingAddress = normalizeStr(shippingAddress);
+  if (notes !== undefined) set.notes = normalizeStr(notes);
   if (estFulfillmentDate !== undefined) {
     const s = normalizeStr(estFulfillmentDate);
     set.estFulfillmentDate = s ? new Date(s) : null;
+  }
+  if (estDeliveredDate !== undefined) {
+    const s = normalizeStr(estDeliveredDate);
+    set.estDeliveredDate = s ? new Date(s) : null;
   }
 
   const prevStatus = normalizeOrderStatus(existing.status || 'processing') || 'processing';
 
   if (lines !== undefined) {
-    if (prevStatus !== 'processing') return res.status(400).json({ message: 'Only processing orders can be edited' });
+    if (prevStatus !== 'processing' && prevStatus !== 'ready_to_ship') return res.status(400).json({ message: 'Only processing orders can be edited' });
     if (!Array.isArray(lines)) return res.status(400).json({ message: 'lines must be an array' });
 
     const byLineItemLower = await buildLineItemMap();
@@ -1849,7 +2146,7 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
       }
 
       if (remaining > 0) {
-        return res.status(400).json({ message: NO_STOCKS_MESSAGE });
+        return res.status(400).json({ message: `${NO_STOCKS_MESSAGE} (Pallet Description: ${groupName})` });
       }
     }
 
@@ -1872,6 +2169,14 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
     set.allocations = allocations;
 
     set.lines = nextLines;
+
+    const fullyPrimary = reserveSecond.size === 0 && reserveOnWater.size === 0 && reserveOnProcess.size === 0;
+    set.status = fullyPrimary ? 'ready_to_ship' : 'processing';
+
+    // Only allow setting Estimated Order Delivered when SHIPPED; otherwise clear it
+    if (set.status !== 'shipped') {
+      set.estDeliveredDate = null;
+    }
   }
 
   const doc = await UnfulfilledOrder.findByIdAndUpdate(

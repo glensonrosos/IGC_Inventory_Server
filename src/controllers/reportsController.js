@@ -64,8 +64,8 @@ export const exportReport = async (req, res) => {
 
 export const palletSummaryByGroup = async (req, res) => {
   // Warehouses
-  const warehousesRaw = await Warehouse.find({}).select('name').sort({ name: 1 }).lean();
-  const warehouses = (warehousesRaw || []).map((w) => ({ _id: String(w._id), name: w.name }));
+  const warehousesRaw = await Warehouse.find({}).select('name isPrimary').sort({ name: 1 }).lean();
+  const warehouses = (warehousesRaw || []).map((w) => ({ _id: String(w._id), name: w.name, isPrimary: Boolean(w.isPrimary) }));
   const whIdStrs = warehouses.map(w => String(w._id));
 
   // Warehouse totals (pallet inventory): group by Pallet Group + warehouseId

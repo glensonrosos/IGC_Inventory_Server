@@ -261,6 +261,20 @@ export const importOnProcessPallets = async (req, res) => {
     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
     if (!rows.length) return res.status(400).json({ message: 'Empty worksheet' });
 
+    const expectedHeader = ['PO #', 'Pallet Description', 'Total Pallet'];
+    const normHeader = (h) => String(h || '').trim().toLowerCase();
+    const receivedHeader = Array.isArray(rows[0]) ? rows[0].map(normHeader) : [];
+    const expectedHeaderNorm = expectedHeader.map(normHeader);
+    const headerMatches = receivedHeader.length === expectedHeaderNorm.length
+      && expectedHeaderNorm.every((h, i) => receivedHeader[i] === h);
+    if (!headerMatches) {
+      return res.status(400).json({
+        message: 'Invalid template. Column headers must match the template exactly.',
+        expectedHeader,
+        receivedHeader: Array.isArray(rows[0]) ? rows[0].map((h) => String(h ?? '')) : []
+      });
+    }
+
     const header = rows[0].map(h => String(h).trim().toLowerCase());
     const poIdx = header.findIndex(h => ['po #','po','po#','po number','ponumber'].includes(h));
     const groupIdx = header.findIndex(h => ['pallet description','palletdescription','description','pallet group','palletgroup','group','group name','pallet'].includes(h));
