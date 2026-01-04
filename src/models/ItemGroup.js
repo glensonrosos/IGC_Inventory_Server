@@ -4,7 +4,8 @@ const itemGroupSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, unique: true, trim: true },
     active: { type: Boolean, default: true },
-    lineItem: { type: String, default: '' }
+    lineItem: { type: String, default: '' },
+    price: { type: Number }
   },
   { timestamps: true }
 );

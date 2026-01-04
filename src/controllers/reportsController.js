@@ -4,6 +4,8 @@ import Warehouse from '../models/Warehouse.js';
 import Shipment from '../models/Shipment.js';
 import PalletGroupStock from '../models/PalletGroupStock.js';
 import OnProcessPallet from '../models/OnProcessPallet.js';
+import PalletGroupTxn from '../models/PalletGroupTxn.js';
+import ItemGroup from '../models/ItemGroup.js';
 import { computePacksOnHand, computePalletsOnHand, getPacksPerPallet } from '../utils/calc.js';
 
 export const inventoryReport = async (req, res) => {
@@ -120,4 +122,73 @@ export const palletSummaryByGroup = async (req, res) => {
   const rows = Array.from(byGroup.values()).sort((a, b) => String(a.itemGroup).localeCompare(String(b.itemGroup)));
   res.setHeader('Cache-Control', 'no-store');
   res.json({ warehouses, rows });
+};
+
+export const palletSalesReport = async (req, res) => {
+  const { from, to, top = '20' } = req.query || {};
+
+  const fromStr = String(from || '').trim();
+  const toStr = String(to || '').trim();
+  const isYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || '').trim());
+  if (!isYmd(fromStr) || !isYmd(toStr)) {
+    return res.status(400).json({ message: 'from and to are required (YYYY-MM-DD)' });
+  }
+
+  const fromDt = new Date(`${fromStr}T00:00:00.000Z`);
+  const toDt = new Date(`${toStr}T23:59:59.999Z`);
+  if (Number.isNaN(fromDt.getTime()) || Number.isNaN(toDt.getTime())) {
+    return res.status(400).json({ message: 'Invalid date range' });
+  }
+
+  const topN = Math.max(1, Math.min(200, Math.floor(Number(top || 20) || 20)));
+
+  const groups = await ItemGroup.find({ active: true }).select('name lineItem').lean();
+  const palletIdByGroupLower = new Map((groups || []).map((g) => [String(g?.name || '').trim().toLowerCase(), String(g?.lineItem || '').trim()]));
+
+  const agg = await PalletGroupTxn.aggregate([
+    {
+      $match: {
+        status: 'Delivered',
+        committedAt: { $gte: fromDt, $lte: toDt },
+        palletsDelta: { $gt: 0 },
+      },
+    },
+    {
+      $group: {
+        _id: { groupName: '$groupName' },
+        soldPallets: { $sum: '$palletsDelta' },
+      },
+    },
+  ]);
+
+  const soldByGroupLower = new Map();
+  for (const r of agg || []) {
+    const g = String(r?._id?.groupName || '').trim();
+    const sold = Number(r?.soldPallets || 0);
+    if (!g || !Number.isFinite(sold) || sold <= 0) continue;
+    soldByGroupLower.set(g.toLowerCase(), sold);
+  }
+
+  const topSelling = Array.from(soldByGroupLower.entries())
+    .map(([groupLower, soldPallets]) => {
+      const groupName = (groups || []).find((g) => String(g?.name || '').trim().toLowerCase() === groupLower)?.name || '';
+      const palletId = palletIdByGroupLower.get(groupLower) || '';
+      return { palletId, groupName, soldPallets };
+    })
+    .sort((a, b) => Number(b.soldPallets || 0) - Number(a.soldPallets || 0))
+    .slice(0, topN);
+
+  const nonPerforming = (groups || [])
+    .map((g) => {
+      const groupName = String(g?.name || '').trim();
+      const groupLower = groupName.toLowerCase();
+      const palletId = String(g?.lineItem || '').trim();
+      const soldPallets = Number(soldByGroupLower.get(groupLower) || 0);
+      return { palletId, groupName, soldPallets, reason: soldPallets <= 0 ? '0 sold in selected date range' : '' };
+    })
+    .filter((r) => Number(r.soldPallets || 0) <= 0)
+    .sort((a, b) => String(a.groupName || '').localeCompare(String(b.groupName || '')));
+
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ from: fromStr, to: toStr, topSelling, nonPerforming });
 };

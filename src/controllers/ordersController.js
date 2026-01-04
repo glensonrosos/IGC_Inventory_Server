@@ -143,7 +143,7 @@ const buildOnProcessMap = async ({ resolveToGroupName }) => {
 
 const rebalanceProcessingOrderAllocations = async ({ order, resolveToGroupName }) => {
   const status = normalizeOrderStatus(order?.status || 'processing') || 'processing';
-  if (status !== 'processing' || !order?._id || !order?.warehouseId || !order?.orderNumber) return false;
+  if ((status !== 'processing' && status !== 'ready_to_ship') || !order?._id || !order?.warehouseId || !order?.orderNumber) return false;
 
   const primaryWarehouseId = String(order.warehouseId);
   const secondWarehouse = await getSecondWarehouseFor(primaryWarehouseId);
@@ -872,7 +872,7 @@ const applyFulfilledOrder = async ({ warehouseId, orderNumber, meta, lines, comm
 };
 
 export const createUnfulfilledOrder = async (req, res) => {
-  const { warehouseId, customerEmail, customerName, customerPhone, createdAtOrder, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines = [], status } = req.body || {};
+  const { warehouseId, customerEmail, customerName, customerPhone, createdAtOrder, originalPrice, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines = [], status } = req.body || {};
   if (!warehouseId) return res.status(400).json({ message: 'warehouseId required' });
   if (!Array.isArray(lines) || lines.length === 0) return res.status(400).json({ message: 'lines required' });
   if (!normalizeStr(customerPhone)) return res.status(400).json({ message: 'customerPhone required' });
@@ -1014,6 +1014,13 @@ export const createUnfulfilledOrder = async (req, res) => {
   if (reserveDocs.length) {
     await PalletGroupReservation.insertMany(reserveDocs);
   }
+
+  const nOriginal = Number(originalPrice);
+  const hasOriginal = Number.isFinite(nOriginal);
+  const nDiscount = Number(discountPercent);
+  const hasDiscount = Number.isFinite(nDiscount);
+  const safeDiscount = hasDiscount ? Math.min(100, Math.max(0, nDiscount)) : 0;
+  const computedFinal = hasOriginal ? nOriginal * (1 - safeDiscount / 100) : null;
   const doc = await UnfulfilledOrder.create({
     orderNumber,
     warehouseId,
@@ -1021,6 +1028,9 @@ export const createUnfulfilledOrder = async (req, res) => {
     customerName: normalizeStr(customerName),
     customerPhone: normalizeStr(customerPhone),
     createdAtOrder: createdAtOrder ? new Date(createdAtOrder) : new Date(),
+    originalPrice: hasOriginal ? nOriginal : undefined,
+    discountPercent: hasDiscount ? safeDiscount : undefined,
+    finalPrice: hasOriginal ? computedFinal : undefined,
     estFulfillmentDate: estFulfillmentDate ? new Date(estFulfillmentDate) : undefined,
     estDeliveredDate: nextStatus === 'shipped' && normalizeStr(estDeliveredDate) ? new Date(normalizeStr(estDeliveredDate)) : undefined,
     shippingAddress: normalizeStr(shippingAddress),
@@ -1749,6 +1759,7 @@ export const getUnfulfilledOrderById = async (req, res) => {
 
 export const rebalanceProcessingOrders = async (req, res) => {
   try {
+    const { warehouseId, groupNames } = req.body || {};
     const keyOf = (v) =>
       normalizeStr(v)
         .replace(/\u00a0/g, ' ')
@@ -1764,12 +1775,37 @@ export const rebalanceProcessingOrders = async (req, res) => {
       return byGroupKey.get(k) || byLineItemKey.get(k) || s;
     };
 
-    const rows = await UnfulfilledOrder.find({}).select('_id orderNumber warehouseId status allocations').lean();
+    const filterWarehouseId = String(warehouseId || '').trim();
+    const wantedGroupKeys = new Set(
+      (Array.isArray(groupNames) ? groupNames : [])
+        .map((g) => keyOf(resolveToGroupName(g)))
+        .filter((v) => v)
+    );
+
+    const query = {};
+    if (filterWarehouseId) query.warehouseId = filterWarehouseId;
+
+    const rows = await UnfulfilledOrder.find(query).select('_id orderNumber warehouseId status allocations').lean();
     let updated = 0;
     for (const r of rows || []) {
       try {
         const status = normalizeOrderStatus(r?.status || 'processing') || 'processing';
-        if (status !== 'processing') continue;
+        if (status !== 'processing' && status !== 'ready_to_ship') continue;
+
+        if (wantedGroupKeys.size) {
+          const allocs = Array.isArray(r?.allocations) ? r.allocations : [];
+          let hit = false;
+          for (const a of allocs) {
+            const g = resolveToGroupName(a?.groupName || '');
+            const k = keyOf(g);
+            if (k && wantedGroupKeys.has(k)) {
+              hit = true;
+              break;
+            }
+          }
+          if (!hit) continue;
+        }
+
         const changed = await rebalanceProcessingOrderAllocations({ order: r, resolveToGroupName });
         if (changed) updated += 1;
       } catch {
@@ -2005,9 +2041,9 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
 
 export const updateUnfulfilledOrderDetails = async (req, res) => {
   const { id } = req.params;
-  const { customerName, customerEmail, customerPhone, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines } = req.body || {};
+  const { customerName, customerEmail, customerPhone, originalPrice, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines } = req.body || {};
 
-  const existing = await UnfulfilledOrder.findById(id).select('status warehouseId orderNumber lines').lean();
+  const existing = await UnfulfilledOrder.findById(id).select('status warehouseId orderNumber lines originalPrice discountPercent').lean();
   if (!existing) return res.status(404).json({ message: 'Order not found' });
   if (normalizeOrderStatus(existing.status || '') === 'completed') return res.status(400).json({ message: 'Completed orders are locked' });
 
@@ -2015,6 +2051,14 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
   if (customerName !== undefined) set.customerName = normalizeStr(customerName);
   if (customerEmail !== undefined) set.customerEmail = normalizeStr(customerEmail);
   if (customerPhone !== undefined) set.customerPhone = normalizeStr(customerPhone);
+  if (originalPrice !== undefined) {
+    const n = Number(originalPrice);
+    set.originalPrice = Number.isFinite(n) ? n : null;
+  }
+  if (discountPercent !== undefined) {
+    const n = Number(discountPercent);
+    set.discountPercent = Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : null;
+  }
   if (shippingAddress !== undefined) set.shippingAddress = normalizeStr(shippingAddress);
   if (notes !== undefined) set.notes = normalizeStr(notes);
   if (estFulfillmentDate !== undefined) {
@@ -2024,6 +2068,15 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
   if (estDeliveredDate !== undefined) {
     const s = normalizeStr(estDeliveredDate);
     set.estDeliveredDate = s ? new Date(s) : null;
+  }
+
+  if (originalPrice !== undefined || discountPercent !== undefined) {
+    const nextOriginal = originalPrice !== undefined ? Number(originalPrice) : Number(existing?.originalPrice);
+    const nextDiscount = discountPercent !== undefined ? Number(discountPercent) : Number(existing?.discountPercent);
+    const hasOriginal = Number.isFinite(nextOriginal);
+    const hasDiscount = Number.isFinite(nextDiscount);
+    const safeDiscount = hasDiscount ? Math.min(100, Math.max(0, nextDiscount)) : 0;
+    set.finalPrice = hasOriginal ? nextOriginal * (1 - safeDiscount / 100) : null;
   }
 
   const prevStatus = normalizeOrderStatus(existing.status || 'processing') || 'processing';
