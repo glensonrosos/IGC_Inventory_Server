@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { createOrder, assignPallets, autoAllocate, previewFulfilledCsv, commitFulfilledCsv, createFulfilledManual, createUnfulfilledOrder, listUnfulfilledOrders, listFulfilledImports, getUnfulfilledOrderById, updateUnfulfilledOrderStatus, updateUnfulfilledOrderDetails, getImportedOrderById, updateImportedOrderStatus, updateImportedOrderDetails, checkImportedOrderStock, checkUnfulfilledOrderStock, palletPicker } from '../controllers/ordersController.js';
+import { createOrder, assignPallets, autoAllocate, previewFulfilledCsv, commitFulfilledCsv, createFulfilledManual, createUnfulfilledOrder, listUnfulfilledOrders, listFulfilledImports, getUnfulfilledOrderById, updateUnfulfilledOrderStatus, updateUnfulfilledOrderDetails, getImportedOrderById, updateImportedOrderStatus, updateImportedOrderDetails, checkImportedOrderStock, checkUnfulfilledOrderStock, palletPicker, onWaterDetails, onProcessDetails, rebalanceProcessingOrders } from '../controllers/ordersController.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -16,9 +16,12 @@ router.put('/fulfilled/imports/:id/status', updateImportedOrderStatus);
 router.put('/fulfilled/imports/:id', updateImportedOrderDetails);
 
 router.get('/pallet-picker', palletPicker);
+router.get('/pallet-picker/on-water', onWaterDetails);
+router.get('/pallet-picker/on-process', onProcessDetails);
 
 router.post('/unfulfilled', createUnfulfilledOrder);
 router.get('/unfulfilled', listUnfulfilledOrders);
+router.post('/unfulfilled/rebalance-processing', rebalanceProcessingOrders);
 router.get('/unfulfilled/:id', getUnfulfilledOrderById);
 router.get('/unfulfilled/:id/stock-check', checkUnfulfilledOrderStock);
 router.put('/unfulfilled/:id/status', updateUnfulfilledOrderStatus);

@@ -15,6 +15,23 @@ export const importPreview = async (req, res) => {
   if (!warehouseId) return res.status(400).json({ message: 'warehouseId required' });
   const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
   const ws = wb.Sheets[wb.SheetNames[0]];
+  const rawRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+  if (!rawRows.length) return res.status(400).json({ message: 'Empty worksheet' });
+
+  const expectedHeader = ['PO #', 'Pallet Description', 'Total Pallet'];
+  const normHeader = (h) => String(h || '').trim().toLowerCase();
+  const receivedHeader = Array.isArray(rawRows[0]) ? rawRows[0].map(normHeader) : [];
+  const expectedHeaderNorm = expectedHeader.map(normHeader);
+  const headerMatches = receivedHeader.length === expectedHeaderNorm.length
+    && expectedHeaderNorm.every((h, i) => receivedHeader[i] === h);
+  if (!headerMatches) {
+    return res.status(400).json({
+      message: 'Invalid template. Column headers must match the template exactly.',
+      expectedHeader,
+      receivedHeader: Array.isArray(rawRows[0]) ? rawRows[0].map((h) => String(h ?? '')) : []
+    });
+  }
+
   const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
   let totalRows = rows.length;
   const errors = [];
@@ -67,6 +84,23 @@ export const importCommit = async (req, res) => {
 
   const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
   const ws = wb.Sheets[wb.SheetNames[0]];
+  const rawRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+  if (!rawRows.length) return res.status(400).json({ message: 'Empty worksheet' });
+
+  const expectedHeader = ['PO #', 'Pallet Description', 'Total Pallet'];
+  const normHeader = (h) => String(h || '').trim().toLowerCase();
+  const receivedHeader = Array.isArray(rawRows[0]) ? rawRows[0].map(normHeader) : [];
+  const expectedHeaderNorm = expectedHeader.map(normHeader);
+  const headerMatches = receivedHeader.length === expectedHeaderNorm.length
+    && expectedHeaderNorm.every((h, i) => receivedHeader[i] === h);
+  if (!headerMatches) {
+    return res.status(400).json({
+      message: 'Invalid template. Column headers must match the template exactly.',
+      expectedHeader,
+      receivedHeader: Array.isArray(rawRows[0]) ? rawRows[0].map((h) => String(h ?? '')) : []
+    });
+  }
+
   const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
   const errors = [];
   let created = 0;
