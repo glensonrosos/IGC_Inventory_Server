@@ -1,6 +1,12 @@
 import ItemGroup from '../models/ItemGroup.js';
 import XLSX from 'xlsx';
 import Item from '../models/Item.js';
+import PalletGroupStock from '../models/PalletGroupStock.js';
+import PalletGroupReservation from '../models/PalletGroupReservation.js';
+import PalletGroupTxn from '../models/PalletGroupTxn.js';
+import OnProcessPallet from '../models/OnProcessPallet.js';
+import UnfulfilledOrder from '../models/UnfulfilledOrder.js';
+import FulfilledOrderImport from '../models/FulfilledOrderImport.js';
 
 export const listItemGroups = async (req, res) => {
   const groups = await ItemGroup.find({}).sort({ name: 1 }).lean();
@@ -48,6 +54,55 @@ export const updateItemGroup = async (req, res) => {
   return res.json(doc);
 };
 
+export const renameItemGroup = async (req, res) => {
+  try {
+    const { id } = req.params || {};
+    const nextName = String(req.body?.name || '').trim();
+    if (!id) return res.status(400).json({ message: 'id required' });
+    if (!nextName) return res.status(400).json({ message: 'name required' });
+
+    const group = await ItemGroup.findById(id);
+    if (!group) return res.status(404).json({ message: 'Item group not found' });
+
+    const prevName = String(group.name || '').trim();
+    if (!prevName) return res.status(400).json({ message: 'Invalid group name' });
+    if (prevName === nextName) return res.json({ ok: true, renamed: false });
+
+    const exists = await ItemGroup.findOne({ _id: { $ne: id }, name: nextName });
+    if (exists) return res.status(409).json({ message: 'Item group already exists' });
+
+    await ItemGroup.updateOne({ _id: id }, { $set: { name: nextName } });
+
+    const updates = {};
+    updates.items = (await Item.updateMany({ itemGroup: prevName }, { $set: { itemGroup: nextName } })).modifiedCount;
+    updates.stock = (await PalletGroupStock.updateMany({ groupName: prevName }, { $set: { groupName: nextName } })).modifiedCount;
+    updates.reservations = (await PalletGroupReservation.updateMany({ groupName: prevName }, { $set: { groupName: nextName } })).modifiedCount;
+    updates.txns = (await PalletGroupTxn.updateMany({ groupName: prevName }, { $set: { groupName: nextName } })).modifiedCount;
+    updates.onProcess = (await OnProcessPallet.updateMany({ groupName: prevName }, { $set: { groupName: nextName } })).modifiedCount;
+
+    await UnfulfilledOrder.updateMany(
+      { 'lines.groupName': prevName },
+      { $set: { 'lines.$[e].groupName': nextName } },
+      { arrayFilters: [{ 'e.groupName': prevName }] }
+    );
+    await UnfulfilledOrder.updateMany(
+      { 'allocations.groupName': prevName },
+      { $set: { 'allocations.$[e].groupName': nextName } },
+      { arrayFilters: [{ 'e.groupName': prevName }] }
+    );
+
+    await FulfilledOrderImport.updateMany(
+      { 'lines.groupName': prevName },
+      { $set: { 'lines.$[e].groupName': nextName } },
+      { arrayFilters: [{ 'e.groupName': prevName }] }
+    );
+
+    return res.json({ ok: true, renamed: true, updates });
+  } catch (e) {
+    return res.status(500).json({ message: 'Failed to rename Pallet Description' });
+  }
+};
+
 export const importItemGroups = async (req, res) => {
   try {
     if (!req.file || !req.file.buffer) {
@@ -60,16 +115,21 @@ export const importItemGroups = async (req, res) => {
     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
     if (!rows.length) return res.status(400).json({ message: 'Empty worksheet' });
 
+    const expectedHeaderNoPrice = ['Pallet Description', 'Pallet ID', 'Item Code', 'Item Description', 'Color', 'Pack Size'];
     const expectedHeaderWithPrice = ['Pallet Description', 'Pallet ID', 'Price', 'Item Code', 'Item Description', 'Color', 'Pack Size'];
     const normHeader = (h) => String(h || '').trim().toLowerCase();
     const receivedHeader = Array.isArray(rows[0]) ? rows[0].map(normHeader) : [];
+    const expectedHeaderNoPriceNorm = expectedHeaderNoPrice.map(normHeader);
     const expectedHeaderWithPriceNorm = expectedHeaderWithPrice.map(normHeader);
-    const headerMatches = receivedHeader.length === expectedHeaderWithPriceNorm.length
+    const headerMatchesNoPrice = receivedHeader.length === expectedHeaderNoPriceNorm.length
+      && expectedHeaderNoPriceNorm.every((h, i) => receivedHeader[i] === h);
+    const headerMatchesWithPrice = receivedHeader.length === expectedHeaderWithPriceNorm.length
       && expectedHeaderWithPriceNorm.every((h, i) => receivedHeader[i] === h);
+    const headerMatches = headerMatchesNoPrice || headerMatchesWithPrice;
     if (!headerMatches) {
       return res.status(400).json({
         message: 'Invalid template. Column headers must match the template exactly.',
-        expectedHeader: expectedHeaderWithPrice,
+        expectedHeader: expectedHeaderNoPrice,
         receivedHeader: Array.isArray(rows[0]) ? rows[0].map((h) => String(h ?? '')) : []
       });
     }
@@ -235,7 +295,6 @@ export const importItemGroups = async (req, res) => {
 
         // Enforce required columns for pallet template
         if (!li) missingRequired('Pallet ID', rowNum, rawName);
-        if (!rawPrice) missingRequired('Price', rowNum, rawName);
         if (!itemCode) missingRequired('Item Code', rowNum, rawName);
         const desc = itemDescIdx >= 0 ? (row[itemDescIdx] ?? '').toString().trim() : '';
         const color = itemColorIdx >= 0 ? (row[itemColorIdx] ?? '').toString().trim() : '';
@@ -244,9 +303,14 @@ export const importItemGroups = async (req, res) => {
         if (!desc) missingRequired('Item Description', rowNum, rawName);
         if (!color) missingRequired('Color', rowNum, rawName);
 
-        const priceNum = rawPrice === '' ? NaN : Number(rawPrice);
-        if (!Number.isFinite(priceNum)) {
-          errors.push({ rowNum, name: rawName, errors: ['Price must be a valid number'] });
+        let priceNum;
+        if (priceIdx >= 0) {
+          if (!rawPrice) missingRequired('Price', rowNum, rawName);
+          const parsedPrice = rawPrice === '' ? NaN : Number(rawPrice);
+          priceNum = parsedPrice;
+          if (!Number.isFinite(parsedPrice)) {
+            errors.push({ rowNum, name: rawName, errors: ['Price must be a valid number'] });
+          }
         }
 
         itemParsed.push({ groupName: rawName, lineItem: li, itemCode, description: desc, color, packSize: packVal, rowNum, price: priceNum });
