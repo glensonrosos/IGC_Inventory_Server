@@ -28,6 +28,20 @@ const fmtDateYmd = (d) => {
 
 const NO_STOCKS_MESSAGE = 'NO Stocks available, please Produce Product from the On-Process Page';
 
+const noStocksPayload = ({ items }) => {
+  const list = Array.isArray(items) ? items : [];
+  return {
+    code: 'NO_STOCKS',
+    message: NO_STOCKS_MESSAGE,
+    noStocks: list.map((it) => ({
+      lineItem: String(it?.lineItem || '').trim(),
+      groupName: String(it?.groupName || '').trim(),
+      required: Math.max(0, Math.floor(Number(it?.required || 0))),
+      available: Math.max(0, Math.floor(Number(it?.available || 0))),
+    })),
+  };
+};
+
 const getSecondWarehouseFor = async (warehouseId) => {
   const wid = String(warehouseId || '').trim();
   if (!wid) return null;
@@ -937,6 +951,8 @@ export const createUnfulfilledOrder = async (req, res) => {
   const reserveOnWater = new Map();
   const reserveOnProcess = new Map();
 
+  const shortages = [];
+
   for (const ln of parsedLines) {
     const groupName = String(ln.groupName || '').trim();
     const need = Math.floor(Number(ln.qty || 0));
@@ -991,8 +1007,17 @@ export const createUnfulfilledOrder = async (req, res) => {
     }
 
     if (remaining > 0) {
-      return res.status(400).json({ message: `${NO_STOCKS_MESSAGE} (Pallet Description: ${groupName})` });
+      shortages.push({
+        lineItem: String(ln?.lineItem || '').trim(),
+        groupName,
+        required: need,
+        available: Math.max(0, need - remaining),
+      });
     }
+  }
+
+  if (shortages.length) {
+    return res.status(400).json(noStocksPayload({ items: shortages }));
   }
 
   // Create reservations (all tiers). Physical stock is only deducted when order becomes SHIPPED.
@@ -1104,6 +1129,7 @@ export const palletPicker = async (req, res) => {
       .lean();
     const onWater = new Map();
     const onWaterEdd = new Map();
+    const onWaterShipments = new Map();
     const re = /pallet-group:([^;|]+);\s*pallets:(\d+)/gi;
     for (const s of ships) {
       const text = String(s?.notes || '');
@@ -1119,6 +1145,9 @@ export const palletPicker = async (req, res) => {
         if (d && !Number.isNaN(d.getTime())) {
           const prev = onWaterEdd.get(groupKey);
           if (!prev || d.getTime() > prev.getTime()) onWaterEdd.set(groupKey, d);
+
+          if (!onWaterShipments.has(groupKey)) onWaterShipments.set(groupKey, []);
+          onWaterShipments.get(groupKey).push({ d, qty: pallets });
         }
       }
     }
@@ -1203,6 +1232,11 @@ export const palletPicker = async (req, res) => {
         const reservedOnProcess = Number(reserved.onProcess.get(groupName) || 0);
         const onWaterAvail = Math.max(0, Number(onWater.get(groupKey) || 0) - reservedOnWater);
         const onProcessAvail = Math.max(0, Number(onProcess.get(groupKey) || 0) - reservedOnProcess);
+
+        const shipList = (onWaterShipments.get(groupKey) || [])
+          .filter((x) => x?.d && !Number.isNaN(x.d.getTime()) && Number(x?.qty || 0) > 0)
+          .sort((a, b) => a.d.getTime() - b.d.getTime())
+          .map((x) => ({ edd: fmtDateYmd(x.d) || '', qty: Number(x.qty || 0) }));
         return {
           groupName,
           lineItem,
@@ -1211,6 +1245,7 @@ export const palletPicker = async (req, res) => {
           queuedPallets: Number(queued.get(groupKey) || 0),
           onWaterPallets: onWaterAvail,
           onWaterEdd: fmtDateYmd(onWaterEdd.get(groupKey) || null) || '',
+          onWaterShipments: shipList,
           onProcessPallets: onProcessAvail,
           onProcessEdd: fmtDateYmd(onProcessEdd.get(groupKey) || null) || '',
         };
@@ -1323,6 +1358,7 @@ export const listUnfulfilledOrders = async (req, res) => {
   const whIds = Array.from(new Set((docs || []).map((d) => String(d?.warehouseId || '').trim()).filter((v) => v)));
 
   const onWaterEddByWarehouse = new Map();
+  const onWaterShipmentsByWarehouse = new Map();
   if (whIds.length) {
     const ships = await Shipment.find({
       status: 'on_water',
@@ -1352,6 +1388,11 @@ export const listUnfulfilledOrders = async (req, res) => {
         const mm = onWaterEddByWarehouse.get(wid);
         const prev = mm.get(groupKey);
         if (!prev || d.getTime() > prev.getTime()) mm.set(groupKey, d);
+
+        if (!onWaterShipmentsByWarehouse.has(wid)) onWaterShipmentsByWarehouse.set(wid, new Map());
+        const sm = onWaterShipmentsByWarehouse.get(wid);
+        if (!sm.has(groupKey)) sm.set(groupKey, []);
+        sm.get(groupKey).push({ d, qty: Math.floor(pallets) });
       }
     }
   }
@@ -1419,11 +1460,11 @@ export const listUnfulfilledOrders = async (req, res) => {
         if (!orderNumber || !source || !Number.isFinite(qty) || qty <= 0) continue;
 
         if (!reservationByOrder.has(orderNumber)) {
-          reservationByOrder.set(orderNumber, { hasSecond: false, onWaterKeys: new Set(), onProcessKeys: new Set(), primaryUpdatedAt: null });
+          reservationByOrder.set(orderNumber, { hasSecond: false, onWater: new Map(), onProcessKeys: new Set(), primaryUpdatedAt: null });
         }
         const rec = reservationByOrder.get(orderNumber);
         if (source === 'second') rec.hasSecond = true;
-        else if (source === 'on_water' && groupKey) rec.onWaterKeys.add(groupKey);
+        else if (source === 'on_water' && groupKey) rec.onWater.set(groupKey, (rec.onWater.get(groupKey) || 0) + qty);
         else if (source === 'on_process' && groupKey) rec.onProcessKeys.add(groupKey);
         else if (source === 'primary') {
           const dt = (r?.maxUpdatedAt ? new Date(r.maxUpdatedAt) : null);
@@ -1438,21 +1479,51 @@ export const listUnfulfilledOrders = async (req, res) => {
     // ignore; fall back to existing stored estFulfillmentDate
   }
 
+  const computeOnWaterCompletionYmd = ({ warehouseId, groupKey, neededQty }) => {
+    const wid = String(warehouseId || '').trim();
+    const gk = String(groupKey || '').trim();
+    let remaining = Math.max(0, Math.floor(Number(neededQty || 0)));
+    if (!wid || !gk || !Number.isFinite(remaining) || remaining <= 0) return '';
+
+    const sm = onWaterShipmentsByWarehouse.get(wid);
+    const list = sm && sm.get(gk) ? sm.get(gk) : [];
+    const ships = (Array.isArray(list) ? list : [])
+      .filter((x) => x?.d && !Number.isNaN(new Date(x.d).getTime()) && Number(x?.qty || 0) > 0)
+      .map((x) => ({ d: new Date(x.d), qty: Math.floor(Number(x.qty || 0)) }))
+      .filter((x) => !Number.isNaN(x.d.getTime()) && x.qty > 0)
+      .sort((a, b) => a.d.getTime() - b.d.getTime());
+
+    let last = null;
+    for (const s of ships) {
+      if (remaining <= 0) break;
+      const take = Math.min(remaining, Math.max(0, s.qty));
+      if (take <= 0) continue;
+      remaining -= take;
+      last = s.d;
+    }
+
+    if (remaining <= 0 && last) return toYmd(last);
+    // fallback to previous aggregated behavior (latest EDD) if we can't cover
+    const map = onWaterEddByWarehouse.get(wid);
+    const d2 = map ? map.get(gk) : null;
+    return d2 ? toYmd(d2) : '';
+  };
+
   const out = (docs || []).map((d) => {
     const status = normalizeOrderStatus(d?.status || 'processing') || 'processing';
     if (status !== 'processing' && status !== 'ready_to_ship') return d;
 
     const orderNumber = String(d?.orderNumber || '').trim();
-    const r = orderNumber && reservationByOrder.has(orderNumber) ? reservationByOrder.get(orderNumber) : { hasSecond: false, onWaterKeys: new Set(), onProcessKeys: new Set(), primaryUpdatedAt: null };
+    const r = orderNumber && reservationByOrder.has(orderNumber)
+      ? reservationByOrder.get(orderNumber)
+      : { hasSecond: false, onWater: new Map(), onProcessKeys: new Set(), primaryUpdatedAt: null };
 
     const wid = String(d?.warehouseId || '').trim();
-    const onWaterMap = wid && onWaterEddByWarehouse.has(wid) ? onWaterEddByWarehouse.get(wid) : null;
 
     let best = '';
 
-    for (const gKey of Array.from(r?.onWaterKeys || [])) {
-      const d2 = onWaterMap ? onWaterMap.get(gKey) : null;
-      const ymd = d2 ? toYmd(d2) : '';
+    for (const [gKey, qty] of Array.from((r?.onWater || new Map()).entries())) {
+      const ymd = computeOnWaterCompletionYmd({ warehouseId: wid, groupKey: gKey, neededQty: qty });
       if (ymd && (!best || ymd > best)) best = ymd;
     }
     for (const gKey of Array.from(r?.onProcessKeys || [])) {
@@ -1464,7 +1535,8 @@ export const listUnfulfilledOrders = async (req, res) => {
 
     // If fully primary (no second/on-water/on-process), use the completion date (primary reservation last updated)
     // and mark order READY TO SHIP; otherwise keep it PROCESSING.
-    const fullyPrimary = !r?.hasSecond && !(r?.onWaterKeys && r.onWaterKeys.size) && !(r?.onProcessKeys && r.onProcessKeys.size);
+    const hasOnWater = r?.onWater && typeof r.onWater?.size === 'number' ? r.onWater.size > 0 : false;
+    const fullyPrimary = !r?.hasSecond && !hasOnWater && !(r?.onProcessKeys && r.onProcessKeys.size);
     const primaryDone = r?.primaryUpdatedAt ? toYmd(r.primaryUpdatedAt) : '';
     // If this order pulls from the 2nd warehouse, shipdate is at least today + 3 months.
     // Final shipdate should be the maximum across all applicable sources.
@@ -1619,6 +1691,8 @@ export const updateImportedOrderStatus = async (req, res) => {
     const reserveOnWater = new Map();
     const reserveOnProcess = new Map();
 
+    const shortages = [];
+
     for (const ln of orderLines) {
       const groupName = String(ln.groupName || '').trim();
       const need = Math.floor(Number(ln.qty || 0));
@@ -1667,8 +1741,17 @@ export const updateImportedOrderStatus = async (req, res) => {
       }
 
       if (remaining > 0) {
-        return res.status(400).json({ message: `${NO_STOCKS_MESSAGE} (Pallet Description: ${groupName})` });
+        shortages.push({
+          lineItem: String(ln?.lineItem || '').trim(),
+          groupName,
+          required: need,
+          available: Math.max(0, need - remaining),
+        });
       }
+    }
+
+    if (shortages.length) {
+      return res.status(400).json(noStocksPayload({ items: shortages }));
     }
 
     const primaryLines = Array.from(deductPrimary.entries()).map(([groupName, qty]) => ({ groupName, qty }));
@@ -1919,6 +2002,8 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
     const reserveOnWater = new Map();
     const reserveOnProcess = new Map();
 
+    const shortages = [];
+
     for (const ln of orderLines) {
       const groupName = String(ln.groupName || '').trim();
       const need = Math.floor(Number(ln.qty || 0));
@@ -1969,8 +2054,17 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
       }
 
       if (remaining > 0) {
-        return res.status(400).json({ message: `${NO_STOCKS_MESSAGE} (Pallet Description: ${groupName})` });
+        shortages.push({
+          lineItem: String(ln?.lineItem || '').trim(),
+          groupName,
+          required: need,
+          available: Math.max(0, need - remaining),
+        });
       }
+    }
+
+    if (shortages.length) {
+      return res.status(400).json(noStocksPayload({ items: shortages }));
     }
 
     const reserveDocs = [];
@@ -2149,6 +2243,8 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
     const reserveOnWater = new Map();
     const reserveOnProcess = new Map();
 
+    const shortages = [];
+
     for (const ln of nextLines) {
       const groupName = String(ln.groupName || '').trim();
       const need = Math.floor(Number(ln.qty || 0));
@@ -2199,8 +2295,17 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
       }
 
       if (remaining > 0) {
-        return res.status(400).json({ message: `${NO_STOCKS_MESSAGE} (Pallet Description: ${groupName})` });
+        shortages.push({
+          lineItem: String(ln?.lineItem || '').trim(),
+          groupName,
+          required: need,
+          available: Math.max(0, need - remaining),
+        });
       }
+    }
+
+    if (shortages.length) {
+      return res.status(400).json(noStocksPayload({ items: shortages }));
     }
 
     const reserveDocs = [];

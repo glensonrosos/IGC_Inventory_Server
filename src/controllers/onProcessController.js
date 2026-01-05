@@ -112,7 +112,7 @@ export const importOnProcess = async (req, res) => {
         let batch = await OnProcessBatch.findOne({ poNumber: po });
         if (!batch) {
           const d = new Date();
-          d.setMonth(d.getMonth() + 1);
+          d.setMonth(d.getMonth() + 2);
           const c = await Counter.findOneAndUpdate(
             { name: 'on_process' },
             { $inc: { seq: 1 } },
@@ -122,7 +122,7 @@ export const importOnProcess = async (req, res) => {
           batch = await OnProcessBatch.create({ poNumber: po, reference: ref, estFinishDate: d, createdBy: req.user?.id });
         } else if (!batch.estFinishDate) {
           const d = new Date();
-          d.setMonth(d.getMonth() + 1);
+          d.setMonth(d.getMonth() + 2);
           batch.estFinishDate = d;
           await batch.save();
         }
@@ -328,7 +328,7 @@ export const importOnProcessPallets = async (req, res) => {
         let batch = await OnProcessBatch.findOne({ poNumber: po });
         if (!batch) {
           const d = new Date();
-          d.setMonth(d.getMonth() + 1);
+          d.setMonth(d.getMonth() + 2);
           const c = await Counter.findOneAndUpdate(
             { name: 'on_process' },
             { $inc: { seq: 1 } },
@@ -338,7 +338,7 @@ export const importOnProcessPallets = async (req, res) => {
           batch = await OnProcessBatch.create({ poNumber: po, reference: ref, estFinishDate: d, createdBy: req.user?.id });
         } else if (!batch.estFinishDate) {
           const d = new Date();
-          d.setMonth(d.getMonth() + 1);
+          d.setMonth(d.getMonth() + 2);
           batch.estFinishDate = d;
           await batch.save();
         }
