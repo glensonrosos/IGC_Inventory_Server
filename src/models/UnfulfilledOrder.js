@@ -20,6 +20,18 @@ const unfulfilledOrderAllocationSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const unfulfilledOrderPostActionSchema = new mongoose.Schema(
+  {
+    kind: { type: String, enum: ['returned', 'damaged'], required: true },
+    groupName: { type: String, required: true, trim: true },
+    qty: { type: Number, required: true },
+    notes: { type: String, trim: true },
+    committedAt: { type: Date, default: Date.now },
+    committedBy: { type: String, default: '' },
+  },
+  { _id: false }
+);
+
 const unfulfilledOrderSchema = new mongoose.Schema(
   {
     orderNumber: { type: String, required: true, unique: true, trim: true },
@@ -37,8 +49,10 @@ const unfulfilledOrderSchema = new mongoose.Schema(
     notes: { type: String, trim: true },
     lines: { type: [unfulfilledOrderLineSchema], default: [] },
     allocations: { type: [unfulfilledOrderAllocationSchema], default: [] },
+    postActions: { type: [unfulfilledOrderPostActionSchema], default: [] },
     status: { type: String, enum: ['processing','ready_to_ship','shipped','delivered','completed','canceled','create','backorder','fulfilled','cancel','created','cancelled'], default: 'processing' },
     committedBy: { type: String, default: '' },
+    lastUpdatedBy: { type: String, default: '' },
   },
   { timestamps: true }
 );
