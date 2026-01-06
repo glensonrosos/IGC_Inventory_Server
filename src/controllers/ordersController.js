@@ -458,6 +458,235 @@ const applyInventoryDeltaForOrder = async ({ warehouseId, orderNumber, lines, co
   }
 };
 
+const getPostActionSumsByGroup = (postActions) => {
+  const rows = Array.isArray(postActions) ? postActions : [];
+  const byGroup = new Map();
+  for (const a of rows) {
+    const g = normalizeStr(a?.groupName || '');
+    const kind = normalizeStr(a?.kind || '').toLowerCase();
+    const qty = Math.floor(Number(a?.qty || 0));
+    if (!g || !Number.isFinite(qty) || qty <= 0) continue;
+    if (!byGroup.has(g)) byGroup.set(g, { returned: 0, damaged: 0, total: 0 });
+    const rec = byGroup.get(g);
+    if (kind === 'returned') rec.returned += qty;
+    else if (kind === 'damaged') rec.damaged += qty;
+    rec.total += qty;
+  }
+  return byGroup;
+};
+
+const getOrderedQtyByGroup = (lines) => {
+  const out = new Map();
+  const list = Array.isArray(lines) ? lines : [];
+  for (const ln of list) {
+    const g = normalizeStr(ln?.groupName || '');
+    const qty = Math.floor(Number(ln?.qty || 0));
+    if (!g || !Number.isFinite(qty) || qty <= 0) continue;
+    out.set(g, (out.get(g) || 0) + qty);
+  }
+  return out;
+};
+
+export const returnCompletedOrderPallets = async (req, res) => {
+  const { id } = req.params;
+  const { groupName, qty, notes, actions, committedAt } = req.body || {};
+
+  const doc = await UnfulfilledOrder.findById(id);
+  if (!doc) return res.status(404).json({ message: 'Order not found' });
+
+  const status = normalizeStr(doc.status || '').toLowerCase();
+  if (status !== 'completed' && status !== 'shipped') return res.status(400).json({ message: 'Only shipped/completed orders can be adjusted' });
+
+  const shipDt = (() => {
+    const d = doc?.estFulfillmentDate ? new Date(doc.estFulfillmentDate) : null;
+    return d && !Number.isNaN(d.getTime()) ? d : null;
+  })();
+
+  const orderedByGroup = getOrderedQtyByGroup(doc.lines);
+
+  const actionList = Array.isArray(actions) && actions.length
+    ? actions
+    : [{ groupName, qty, notes, committedAt }];
+
+  const parsed = [];
+  for (const a of actionList) {
+    const g = normalizeStr(a?.groupName || '');
+    const q = Math.floor(Number(a?.qty || 0));
+    const n = normalizeStr(a?.notes || '');
+    if (!g) continue;
+    if (!Number.isFinite(q) || q <= 0) continue;
+    parsed.push({ groupName: g, qty: q, notes: n, committedAt: a?.committedAt });
+  }
+  if (!parsed.length) return res.status(400).json({ message: 'No valid actions provided' });
+
+  for (const p of parsed) {
+    const ordered = Number(orderedByGroup.get(p.groupName) || 0);
+    if (!ordered) return res.status(400).json({ message: `Invalid pallet group: ${p.groupName}` });
+  }
+
+  const usedByGroup = getPostActionSumsByGroup(doc.postActions);
+  const additionalByGroup = new Map();
+  for (const p of parsed) {
+    additionalByGroup.set(p.groupName, (additionalByGroup.get(p.groupName) || 0) + p.qty);
+  }
+  for (const [g, add] of additionalByGroup.entries()) {
+    const ordered = Number(orderedByGroup.get(g) || 0);
+    const used = Number(usedByGroup.get(g)?.total || 0);
+    const remaining = ordered - used;
+    if (add > remaining) {
+      return res.status(400).json({ message: `Qty exceeds remaining for ${g}. Ordered ${ordered}, already adjusted ${used}, remaining ${Math.max(0, remaining)}.` });
+    }
+  }
+
+  const committedBy = String(req.user?.username || req.user?.id || '');
+  const dtFromBody = (() => {
+    const raw = normalizeStr(committedAt);
+    if (!raw) return null;
+    const d = new Date(`${raw}T00:00:00`);
+    return Number.isNaN(d.getTime()) ? null : d;
+  })();
+
+  if (shipDt && dtFromBody && dtFromBody < shipDt) {
+    return res.status(400).json({ message: 'Return/Damage date cannot be earlier than Estimated Shipdate for Customer' });
+  }
+
+  await applyInventoryDeltaForOrder({
+    warehouseId: doc.warehouseId,
+    orderNumber: doc.orderNumber,
+    lines: parsed.map((p) => ({ groupName: p.groupName, qty: p.qty })),
+    committedBy,
+    deltaSign: +1,
+    allowNegative: true,
+    reason: 'returned',
+  });
+
+  doc.postActions = Array.isArray(doc.postActions) ? doc.postActions : [];
+  for (const p of parsed) {
+    const dtFromLine = (() => {
+      const raw = normalizeStr(p?.committedAt);
+      if (!raw) return null;
+      const d = new Date(`${raw}T00:00:00`);
+      return Number.isNaN(d.getTime()) ? null : d;
+    })();
+
+    if (shipDt && dtFromLine && dtFromLine < shipDt) {
+      return res.status(400).json({ message: 'Return/Damage date cannot be earlier than Estimated Shipdate for Customer' });
+    }
+
+    doc.postActions.push({
+      kind: 'returned',
+      groupName: p.groupName,
+      qty: p.qty,
+      notes: p.notes,
+      committedAt: dtFromLine || dtFromBody || new Date(),
+      committedBy,
+    });
+  }
+  doc.lastUpdatedBy = committedBy;
+  await doc.save();
+
+  return res.json({ ok: true, lines: parsed.length });
+};
+
+export const damageCompletedOrderPallets = async (req, res) => {
+  const { id } = req.params;
+  const { groupName, qty, notes, actions, committedAt } = req.body || {};
+
+  const doc = await UnfulfilledOrder.findById(id);
+  if (!doc) return res.status(404).json({ message: 'Order not found' });
+
+  const status = normalizeStr(doc.status || '').toLowerCase();
+  if (status !== 'completed' && status !== 'shipped') return res.status(400).json({ message: 'Only shipped/completed orders can be adjusted' });
+
+  const shipDt = (() => {
+    const d = doc?.estFulfillmentDate ? new Date(doc.estFulfillmentDate) : null;
+    return d && !Number.isNaN(d.getTime()) ? d : null;
+  })();
+
+  const orderedByGroup = getOrderedQtyByGroup(doc.lines);
+
+  const actionList = Array.isArray(actions) && actions.length
+    ? actions
+    : [{ groupName, qty, notes, committedAt }];
+
+  const parsed = [];
+  for (const a of actionList) {
+    const g = normalizeStr(a?.groupName || '');
+    const q = Math.floor(Number(a?.qty || 0));
+    const n = normalizeStr(a?.notes || '');
+    if (!g) continue;
+    if (!Number.isFinite(q) || q <= 0) continue;
+    parsed.push({ groupName: g, qty: q, notes: n, committedAt: a?.committedAt });
+  }
+  if (!parsed.length) return res.status(400).json({ message: 'No valid actions provided' });
+
+  for (const p of parsed) {
+    const ordered = Number(orderedByGroup.get(p.groupName) || 0);
+    if (!ordered) return res.status(400).json({ message: `Invalid pallet group: ${p.groupName}` });
+  }
+
+  const usedByGroup = getPostActionSumsByGroup(doc.postActions);
+  const additionalByGroup = new Map();
+  for (const p of parsed) {
+    additionalByGroup.set(p.groupName, (additionalByGroup.get(p.groupName) || 0) + p.qty);
+  }
+  for (const [g, add] of additionalByGroup.entries()) {
+    const ordered = Number(orderedByGroup.get(g) || 0);
+    const used = Number(usedByGroup.get(g)?.total || 0);
+    const remaining = ordered - used;
+    if (add > remaining) {
+      return res.status(400).json({ message: `Qty exceeds remaining for ${g}. Ordered ${ordered}, already adjusted ${used}, remaining ${Math.max(0, remaining)}.` });
+    }
+  }
+
+  const committedBy = String(req.user?.username || req.user?.id || '');
+  const dtFromBody = (() => {
+    const raw = normalizeStr(committedAt);
+    if (!raw) return null;
+    const d = new Date(`${raw}T00:00:00`);
+    return Number.isNaN(d.getTime()) ? null : d;
+  })();
+
+  // Log-only transactions (no stock change). Keep palletsDelta=0.
+  for (const p of parsed) {
+    await PalletGroupTxn.create({
+      poNumber: normalizeStr(doc.orderNumber),
+      groupName: p.groupName,
+      warehouseId: doc.warehouseId,
+      palletsDelta: 0,
+      status: 'Adjustment',
+      reason: 'damage',
+      committedBy,
+    });
+  }
+
+  doc.postActions = Array.isArray(doc.postActions) ? doc.postActions : [];
+  for (const p of parsed) {
+    const dtFromLine = (() => {
+      const raw = normalizeStr(p?.committedAt);
+      if (!raw) return null;
+      const d = new Date(`${raw}T00:00:00`);
+      return Number.isNaN(d.getTime()) ? null : d;
+    })();
+
+    if (shipDt && dtFromLine && dtFromLine < shipDt) {
+      return res.status(400).json({ message: 'Return/Damage date cannot be earlier than Estimated Shipdate for Customer' });
+    }
+
+    doc.postActions.push({
+      kind: 'damaged',
+      groupName: p.groupName,
+      qty: p.qty,
+      notes: p.notes,
+      committedAt: dtFromLine || dtFromBody || new Date(),
+      committedBy,
+    });
+  }
+  await doc.save();
+
+  return res.json({ ok: true, lines: parsed.length });
+};
+
 export const onWaterDetails = async (req, res) => {
   try {
     const warehouseId = String(req.query.warehouseId || '').trim();
@@ -1579,6 +1808,8 @@ export const updateImportedOrderDetails = async (req, res) => {
 
   const { email, billingName, billingPhone, shippingName, shippingStreet, fulfilledAt, createdAtOrder } = req.body || {};
   const set = {};
+  const committedBy = String(req.user?.username || req.user?.id || '');
+  set.lastUpdatedBy = committedBy;
   if (email !== undefined) set.email = normalizeStr(email);
   if (billingName !== undefined) set.billingName = normalizeStr(billingName);
   if (billingPhone !== undefined) set.billingPhone = normalizeStr(billingPhone);
@@ -1788,7 +2019,7 @@ export const updateImportedOrderStatus = async (req, res) => {
 export const getUnfulfilledOrderById = async (req, res) => {
   const { id } = req.params;
 
-  const raw = await UnfulfilledOrder.findById(id).select('orderNumber warehouseId status allocations').lean();
+  const raw = await UnfulfilledOrder.findById(id).select('orderNumber warehouseId status allocations lastUpdatedBy').lean();
   if (!raw) return res.status(404).json({ message: 'Order not found' });
 
   try {
@@ -1801,6 +2032,7 @@ export const getUnfulfilledOrderById = async (req, res) => {
   const doc = await UnfulfilledOrder.findById(id)
     .populate('warehouseId', 'name')
     .populate('allocations.warehouseId', 'name')
+    .select('orderNumber warehouseId status allocations lines customerEmail customerName customerPhone createdAtOrder originalPrice discountPercent finalPrice estFulfillmentDate estDeliveredDate shippingAddress notes postActions committedBy lastUpdatedBy createdAt updatedAt')
     .lean();
   if (!doc) return res.status(404).json({ message: 'Order not found' });
 
@@ -1968,6 +2200,7 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
     // Always clear reservations on cancel (processing reservations or any leftovers)
     await PalletGroupReservation.deleteMany({ orderNumber: String(doc.orderNumber || '').trim() });
     doc.status = 'canceled';
+    doc.lastUpdatedBy = committedBy;
     await doc.save();
     return res.json(doc.toObject());
   }
@@ -2129,6 +2362,7 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
 
   // shipped/delivered/completed do not change inventory (inventory already affected on processing)
   doc.status = next;
+  doc.lastUpdatedBy = committedBy;
   await doc.save();
   res.json(doc.toObject());
 };
@@ -2142,6 +2376,8 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
   if (normalizeOrderStatus(existing.status || '') === 'completed') return res.status(400).json({ message: 'Completed orders are locked' });
 
   const set = {};
+  const committedBy = String(req.user?.username || req.user?.id || '');
+  set.lastUpdatedBy = committedBy;
   if (customerName !== undefined) set.customerName = normalizeStr(customerName);
   if (customerEmail !== undefined) set.customerEmail = normalizeStr(customerEmail);
   if (customerPhone !== undefined) set.customerPhone = normalizeStr(customerPhone);
@@ -2214,7 +2450,7 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
 
     // processing: reserve-only. Recompute reservations + allocations based on new lines.
     const orderNumber = String(existing.orderNumber || '').trim();
-    const committedBy = String(req.user?.username || req.user?.id || '');
+    // committedBy declared above; keep using it for reservation committedBy
     await PalletGroupReservation.deleteMany({ orderNumber });
 
     const secondWarehouse = await getSecondWarehouseFor(existing.warehouseId);

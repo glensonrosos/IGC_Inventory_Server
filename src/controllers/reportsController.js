@@ -145,18 +145,25 @@ export const palletSalesReport = async (req, res) => {
   const groups = await ItemGroup.find({ active: true }).select('name lineItem').lean();
   const palletIdByGroupLower = new Map((groups || []).map((g) => [String(g?.name || '').trim().toLowerCase(), String(g?.lineItem || '').trim()]));
 
+  // Count actual sales as inventory OUT movements caused by order shipments/fulfillments.
+  // We look for Adjustment transactions with reasons tied to orders and negative palletsDelta.
+  const salesReasons = [
+    'order_shipped',
+    'order_shipped_second_warehouse',
+    'order_fulfilled',
+  ];
   const agg = await PalletGroupTxn.aggregate([
     {
       $match: {
-        status: 'Delivered',
         committedAt: { $gte: fromDt, $lte: toDt },
-        palletsDelta: { $gt: 0 },
+        palletsDelta: { $lt: 0 },
+        reason: { $in: salesReasons },
       },
     },
     {
       $group: {
         _id: { groupName: '$groupName' },
-        soldPallets: { $sum: '$palletsDelta' },
+        soldPallets: { $sum: { $abs: '$palletsDelta' } },
       },
     },
   ]);

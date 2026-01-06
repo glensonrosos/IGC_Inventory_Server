@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { createOrder, assignPallets, autoAllocate, previewFulfilledCsv, commitFulfilledCsv, createFulfilledManual, createUnfulfilledOrder, listUnfulfilledOrders, listFulfilledImports, getUnfulfilledOrderById, updateUnfulfilledOrderStatus, updateUnfulfilledOrderDetails, getImportedOrderById, updateImportedOrderStatus, updateImportedOrderDetails, checkImportedOrderStock, checkUnfulfilledOrderStock, palletPicker, onWaterDetails, onProcessDetails, rebalanceProcessingOrders } from '../controllers/ordersController.js';
+import { createOrder, assignPallets, autoAllocate, previewFulfilledCsv, commitFulfilledCsv, createFulfilledManual, createUnfulfilledOrder, listUnfulfilledOrders, listFulfilledImports, getUnfulfilledOrderById, updateUnfulfilledOrderStatus, updateUnfulfilledOrderDetails, getImportedOrderById, updateImportedOrderStatus, updateImportedOrderDetails, checkImportedOrderStock, checkUnfulfilledOrderStock, palletPicker, onWaterDetails, onProcessDetails, rebalanceProcessingOrders, returnCompletedOrderPallets, damageCompletedOrderPallets } from '../controllers/ordersController.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -26,6 +26,8 @@ router.get('/unfulfilled/:id', getUnfulfilledOrderById);
 router.get('/unfulfilled/:id/stock-check', checkUnfulfilledOrderStock);
 router.put('/unfulfilled/:id/status', updateUnfulfilledOrderStatus);
 router.put('/unfulfilled/:id', updateUnfulfilledOrderDetails);
+router.post('/unfulfilled/:id/return', returnCompletedOrderPallets);
+router.post('/unfulfilled/:id/damage', damageCompletedOrderPallets);
 router.put('/:id/assign-pallets', assignPallets);
 router.put('/:id/auto-allocate', autoAllocate);
 
