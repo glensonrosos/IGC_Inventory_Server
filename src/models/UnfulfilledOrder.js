@@ -41,6 +41,7 @@ const unfulfilledOrderSchema = new mongoose.Schema(
     customerPhone: { type: String, trim: true },
     createdAtOrder: { type: Date },
     originalPrice: { type: Number },
+    shippingPercent: { type: Number },
     discountPercent: { type: Number },
     finalPrice: { type: Number },
     estFulfillmentDate: { type: Date },
