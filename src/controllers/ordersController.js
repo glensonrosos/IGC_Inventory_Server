@@ -1115,7 +1115,7 @@ const applyFulfilledOrder = async ({ warehouseId, orderNumber, meta, lines, comm
 };
 
 export const createUnfulfilledOrder = async (req, res) => {
-  const { warehouseId, customerEmail, customerName, customerPhone, createdAtOrder, originalPrice, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines = [], status } = req.body || {};
+  const { warehouseId, customerEmail, customerName, customerPhone, createdAtOrder, originalPrice, shippingPercent, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines = [], status } = req.body || {};
   if (!warehouseId) return res.status(400).json({ message: 'warehouseId required' });
   if (!Array.isArray(lines) || lines.length === 0) return res.status(400).json({ message: 'lines required' });
   if (!normalizeStr(customerPhone)) return res.status(400).json({ message: 'customerPhone required' });
@@ -1274,7 +1274,10 @@ export const createUnfulfilledOrder = async (req, res) => {
   const nDiscount = Number(discountPercent);
   const hasDiscount = Number.isFinite(nDiscount);
   const safeDiscount = hasDiscount ? Math.min(100, Math.max(0, nDiscount)) : 0;
-  const computedFinal = hasOriginal ? nOriginal * (1 - safeDiscount / 100) : null;
+  const nShipping = Number(shippingPercent);
+  const hasShipping = Number.isFinite(nShipping);
+  const safeShipping = hasShipping ? Math.min(100, Math.max(0, nShipping)) : 0;
+  const computedFinal = hasOriginal ? (nOriginal * (1 - safeDiscount / 100)) + (nOriginal * (safeShipping / 100)) : null;
   const doc = await UnfulfilledOrder.create({
     orderNumber,
     warehouseId,
@@ -1283,6 +1286,7 @@ export const createUnfulfilledOrder = async (req, res) => {
     customerPhone: normalizeStr(customerPhone),
     createdAtOrder: createdAtOrder ? new Date(createdAtOrder) : new Date(),
     originalPrice: hasOriginal ? nOriginal : undefined,
+    shippingPercent: hasShipping ? safeShipping : undefined,
     discountPercent: hasDiscount ? safeDiscount : undefined,
     finalPrice: hasOriginal ? computedFinal : undefined,
     estFulfillmentDate: estFulfillmentDate ? new Date(estFulfillmentDate) : undefined,
@@ -2032,7 +2036,7 @@ export const getUnfulfilledOrderById = async (req, res) => {
   const doc = await UnfulfilledOrder.findById(id)
     .populate('warehouseId', 'name')
     .populate('allocations.warehouseId', 'name')
-    .select('orderNumber warehouseId status allocations lines customerEmail customerName customerPhone createdAtOrder originalPrice discountPercent finalPrice estFulfillmentDate estDeliveredDate shippingAddress notes postActions committedBy lastUpdatedBy createdAt updatedAt')
+    .select('orderNumber warehouseId status allocations lines customerEmail customerName customerPhone createdAtOrder originalPrice shippingPercent discountPercent finalPrice estFulfillmentDate estDeliveredDate shippingAddress notes postActions committedBy lastUpdatedBy createdAt updatedAt')
     .lean();
   if (!doc) return res.status(404).json({ message: 'Order not found' });
 
@@ -2369,9 +2373,9 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
 
 export const updateUnfulfilledOrderDetails = async (req, res) => {
   const { id } = req.params;
-  const { customerName, customerEmail, customerPhone, originalPrice, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines } = req.body || {};
+  const { customerName, customerEmail, customerPhone, originalPrice, shippingPercent, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines } = req.body || {};
 
-  const existing = await UnfulfilledOrder.findById(id).select('status warehouseId orderNumber lines originalPrice discountPercent').lean();
+  const existing = await UnfulfilledOrder.findById(id).select('status warehouseId orderNumber lines originalPrice shippingPercent discountPercent').lean();
   if (!existing) return res.status(404).json({ message: 'Order not found' });
   if (normalizeOrderStatus(existing.status || '') === 'completed') return res.status(400).json({ message: 'Completed orders are locked' });
 
@@ -2384,6 +2388,10 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
   if (originalPrice !== undefined) {
     const n = Number(originalPrice);
     set.originalPrice = Number.isFinite(n) ? n : null;
+  }
+  if (shippingPercent !== undefined) {
+    const n = Number(shippingPercent);
+    set.shippingPercent = Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : null;
   }
   if (discountPercent !== undefined) {
     const n = Number(discountPercent);
@@ -2400,13 +2408,16 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
     set.estDeliveredDate = s ? new Date(s) : null;
   }
 
-  if (originalPrice !== undefined || discountPercent !== undefined) {
+  if (originalPrice !== undefined || discountPercent !== undefined || shippingPercent !== undefined) {
     const nextOriginal = originalPrice !== undefined ? Number(originalPrice) : Number(existing?.originalPrice);
     const nextDiscount = discountPercent !== undefined ? Number(discountPercent) : Number(existing?.discountPercent);
+    const nextShipping = shippingPercent !== undefined ? Number(shippingPercent) : Number(existing?.shippingPercent);
     const hasOriginal = Number.isFinite(nextOriginal);
     const hasDiscount = Number.isFinite(nextDiscount);
+    const hasShipping = Number.isFinite(nextShipping);
     const safeDiscount = hasDiscount ? Math.min(100, Math.max(0, nextDiscount)) : 0;
-    set.finalPrice = hasOriginal ? nextOriginal * (1 - safeDiscount / 100) : null;
+    const safeShipping = hasShipping ? Math.min(100, Math.max(0, nextShipping)) : 0;
+    set.finalPrice = hasOriginal ? (nextOriginal * (1 - safeDiscount / 100)) + (nextOriginal * (safeShipping / 100)) : null;
   }
 
   const prevStatus = normalizeOrderStatus(existing.status || 'processing') || 'processing';
