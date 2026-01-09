@@ -40,7 +40,22 @@ export const listShipments = async (req, res) => {
 
   if (qPallet) {
     const regex = { $regex: toWsRegex(qPallet), $options: 'i' };
-    and.push({ $or: [{ notes: regex }, { 'items.itemCode': regex }] });
+    let groupNameRegex = null;
+    try {
+      const groups = await ItemGroup.find({ lineItem: { $regex: toWsRegex(qPallet), $options: 'i' } }).select('name').lean();
+      const names = (groups || [])
+        .map((g) => String(g?.name || '').trim())
+        .filter((s) => s);
+      if (names.length) {
+        const escaped = names.map((n) => escapeRegExp(n)).join('|');
+        groupNameRegex = { $regex: `(${escaped})`, $options: 'i' };
+      }
+    } catch {
+      // best-effort; ignore lookup errors
+    }
+    const orConds = [{ notes: regex }, { 'items.itemCode': regex }];
+    if (groupNameRegex) orConds.push({ notes: groupNameRegex });
+    and.push({ $or: orConds });
   } else if (legacyQ && !qRef) {
     // legacy behavior: q also searches pallet/notes + item codes when qRef isn't used
     const regex = { $regex: toWsRegex(legacyQ), $options: 'i' };

@@ -1245,9 +1245,7 @@ export const createUnfulfilledOrder = async (req, res) => {
     }
   }
 
-  if (shortages.length) {
-    return res.status(400).json(noStocksPayload({ items: shortages }));
-  }
+  // Allow saving even when shortages exist; proceed with partial reservations
 
   // Create reservations (all tiers). Physical stock is only deducted when order becomes SHIPPED.
   const reserveDocs = [];
@@ -1277,7 +1275,7 @@ export const createUnfulfilledOrder = async (req, res) => {
   const nShipping = Number(shippingPercent);
   const hasShipping = Number.isFinite(nShipping);
   const safeShipping = hasShipping ? Math.min(100, Math.max(0, nShipping)) : 0;
-  const computedFinal = hasOriginal ? (nOriginal * (1 - safeDiscount / 100)) + (nOriginal * (safeShipping / 100)) : null;
+  const computedFinal = hasOriginal ? (nOriginal * (1 - safeDiscount / 100) * (1 + safeShipping / 100)) : null;
   const doc = await UnfulfilledOrder.create({
     orderNumber,
     warehouseId,
@@ -1985,9 +1983,7 @@ export const updateImportedOrderStatus = async (req, res) => {
       }
     }
 
-    if (shortages.length) {
-      return res.status(400).json(noStocksPayload({ items: shortages }));
-    }
+    // Allow updating even when shortages exist; proceed with partial reservations
 
     const primaryLines = Array.from(deductPrimary.entries()).map(([groupName, qty]) => ({ groupName, qty }));
     const secondLines = Array.from(deductSecond.entries()).map(([groupName, qty]) => ({ groupName, qty }));
