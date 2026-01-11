@@ -10,6 +10,7 @@ import Shipment from '../models/Shipment.js';
 import PalletGroupStock from '../models/PalletGroupStock.js';
 import PalletGroupTxn from '../models/PalletGroupTxn.js';
 import PalletGroupReservation from '../models/PalletGroupReservation.js';
+import { rebalanceProcessingOrdersInternal } from './ordersController.js';
 
 export const listOnProcess = async (req, res) => {
   const pallets = await OnProcessPallet.find({}).sort({ createdAt: -1 }).lean();
@@ -403,9 +404,11 @@ export const updateBatchPallets = async (req, res) => {
   let updated = 0;
   let skippedLocked = 0;
   let skippedCancelWithTransfer = 0;
+  const touchedGroups = new Set();
   for (const p of pallets) {
     const { groupName, finishedPallet, totalPallet, status, notes } = p || {};
     if (!groupName) continue;
+    touchedGroups.add(String(groupName));
     // Load doc to respect locking
     const doc = await OnProcessPallet.findOne({ batchId: id, groupName });
     if (!doc) continue;
@@ -461,6 +464,12 @@ export const updateBatchPallets = async (req, res) => {
     const resu = await OnProcessPallet.updateOne({ _id: doc._id }, { $set: update });
     updated += resu.modifiedCount || 0;
   }
+  // Best-effort: trigger order rebalancing for affected pallet groups so Orders table adopts new tier availability
+  try {
+    if (touchedGroups.size) {
+      await rebalanceProcessingOrdersInternal({ groupNames: Array.from(touchedGroups) });
+    }
+  } catch {}
   res.json({ updated, skippedLocked, skippedCancelWithTransfer });
 };
 
@@ -660,6 +669,10 @@ export const transferBatchPallets = async (req, res) => {
     }
     await doc.save();
   }
+  // Best-effort: trigger order rebalancing scoped to this warehouse and affected groups
+  try {
+    await rebalanceProcessingOrdersInternal({ warehouseId, groupNames: toTransfer.map(t => t.groupName) });
+  } catch {}
 
   res.json({ message: 'transfer created', mode, warehouseId, poNumber, items: toTransfer });
 };
