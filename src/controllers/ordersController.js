@@ -1423,7 +1423,7 @@ export const palletPicker = async (req, res) => {
     const warehouses = await Warehouse.find({}).select('name').sort({ name: 1 }).lean();
     const whIds = (warehouses || []).map((w) => String(w._id));
 
-    const groups = await ItemGroup.find({ active: true }).select('name lineItem').lean();
+    const groups = await ItemGroup.find({ active: true }).select('name lineItem palletName').lean();
     const byGroupKey = new Map((groups || []).map((g) => [keyOf(g?.name || ''), String(g?.name || '').trim()]));
     const byLineItemKey = new Map((groups || []).map((g) => [keyOf(g?.lineItem || ''), String(g?.name || '').trim()]));
     const resolveToGroupName = (raw) => {
@@ -1528,6 +1528,43 @@ export const palletPicker = async (req, res) => {
       if (d && !Number.isNaN(d.getTime())) onProcessEdd.set(groupKey, d);
     }
 
+    // On-process per EDD breakdown (groupName x EDD => sum remaining)
+    const opBatchesAgg = await OnProcessPallet.aggregate([
+      { $match: { status: { $ne: 'cancelled' } } },
+      { $addFields: { remaining: { $subtract: ['$totalPallet', { $ifNull: ['$transferredPallet', 0] }] } } },
+      { $match: { remaining: { $gt: 0 } } },
+      {
+        $lookup: {
+          from: OnProcessBatch.collection.name,
+          localField: 'batchId',
+          foreignField: '_id',
+          as: 'batch',
+        },
+      },
+      { $unwind: { path: '$batch', preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: { groupName: '$groupName', edd: '$batch.estFinishDate' },
+          qty: { $sum: '$remaining' },
+        },
+      },
+    ]);
+    const onProcessBatches = new Map(); // groupKey => [{ edd: ymd, qty }]
+    for (const r of opBatchesAgg || []) {
+      const groupName = resolveToGroupName(String(r?._id?.groupName || '').trim());
+      const groupKey = keyOf(groupName);
+      if (!groupKey) continue;
+      const d = r?._id?.edd ? new Date(r._id.edd) : null;
+      const ymd = d && !Number.isNaN(d.getTime()) ? fmtDateYmd(d) : '';
+      const qty = Math.floor(Number(r?.qty || 0));
+      if (!ymd || !Number.isFinite(qty) || qty <= 0) continue;
+      if (!onProcessBatches.has(groupKey)) onProcessBatches.set(groupKey, []);
+      onProcessBatches.get(groupKey).push({ edd: ymd, qty });
+    }
+    for (const [k, list] of onProcessBatches.entries()) {
+      list.sort((a, b) => String(a.edd).localeCompare(String(b.edd)));
+    }
+
     // Queued demand: existing open orders in this warehouse that will consume supply tiers before new orders
     // Include legacy statuses for backward compatibility
     const openStatuses = ['processing', 'create', 'backorder', 'created'];
@@ -1556,6 +1593,7 @@ export const palletPicker = async (req, res) => {
         const groupName = String(g?.name || '').trim();
         const groupKey = keyOf(groupName);
         const lineItem = String(g?.lineItem || '').trim();
+        const palletName = String(g?.palletName || '').trim();
         const basePerWarehouse = stockByGroup.get(groupKey) || {};
 
         // Subtract reserved physical stock from each warehouse bucket so UI reflects queued reservations.
@@ -1572,28 +1610,51 @@ export const palletPicker = async (req, res) => {
         const onWaterAvail = Math.max(0, Number(onWater.get(groupKey) || 0) - reservedOnWater);
         const onProcessAvail = Math.max(0, Number(onProcess.get(groupKey) || 0) - reservedOnProcess);
 
-        const shipList = (onWaterShipments.get(groupKey) || [])
+        // Build On-Water shipments per EDD then deduct reserved On-Water qty earliest-first
+        const shipListRaw = (onWaterShipments.get(groupKey) || [])
           .filter((x) => x?.d && !Number.isNaN(x.d.getTime()) && Number(x?.qty || 0) > 0)
           .sort((a, b) => a.d.getTime() - b.d.getTime())
-          .map((x) => ({ edd: fmtDateYmd(x.d) || '', qty: Number(x.qty || 0) }));
+          .map((x) => ({ edd: fmtDateYmd(x.d) || '', qty: Math.max(0, Math.floor(Number(x.qty || 0))) }));
+        let remainingOnWaterReserved = Math.max(0, reservedOnWater);
+        const adjustedShipList = shipListRaw.map((s) => {
+          if (remainingOnWaterReserved <= 0) return { ...s };
+          const take = Math.min(remainingOnWaterReserved, Math.max(0, s.qty));
+          const qty = Math.max(0, Math.floor(s.qty - take));
+          remainingOnWaterReserved -= take;
+          return { edd: s.edd, qty };
+        });
+
+        // Build On-Process batches per EDD then deduct reserved On-Process qty earliest-first
+        const baseProcessBatches = Array.isArray(onProcessBatches.get(groupKey)) ? onProcessBatches.get(groupKey) : [];
+        let remainingOnProcessReserved = Math.max(0, reservedOnProcess);
+        const adjustedProcessBatches = baseProcessBatches.map((b) => {
+          if (remainingOnProcessReserved <= 0) return { ...b };
+          const take = Math.min(remainingOnProcessReserved, Math.max(0, b.qty));
+          const qty = Math.max(0, Math.floor(b.qty - take));
+          remainingOnProcessReserved -= take;
+          return { edd: b.edd, qty };
+        });
         return {
           groupName,
           lineItem,
+          palletName,
           perWarehouse,
           selectedWarehouseAvailable,
           queuedPallets: Number(queued.get(groupKey) || 0),
           onWaterPallets: onWaterAvail,
           onWaterEdd: fmtDateYmd(onWaterEdd.get(groupKey) || null) || '',
-          onWaterShipments: shipList,
+          onWaterShipments: adjustedShipList,
           onProcessPallets: onProcessAvail,
           onProcessEdd: fmtDateYmd(onProcessEdd.get(groupKey) || null) || '',
+          onProcessBatches: adjustedProcessBatches,
         };
       })
       .filter((r) => {
         if (!q) return true;
         return (
           String(r.groupName || '').toLowerCase().includes(q) ||
-          String(r.lineItem || '').toLowerCase().includes(q)
+          String(r.lineItem || '').toLowerCase().includes(q) ||
+          String(r.palletName || '').toLowerCase().includes(q)
         );
       })
       .sort((a, b) => String(a.groupName).localeCompare(String(b.groupName)));
@@ -2231,7 +2292,7 @@ export const rebalanceProcessingOrdersInternal = async ({ warehouseId, groupName
     const query = {};
     if (filterWarehouseId) query.warehouseId = filterWarehouseId;
 
-    const rows = await UnfulfilledOrder.find(query).select('_id orderNumber warehouseId status allocations').lean();
+    const rows = await UnfulfilledOrder.find(query).select('_id orderNumber warehouseId status allocations lines').lean();
     let updated = 0;
     for (const r of rows || []) {
       try {
@@ -2239,14 +2300,21 @@ export const rebalanceProcessingOrdersInternal = async ({ warehouseId, groupName
         if (status !== 'processing' && status !== 'ready_to_ship') continue;
 
         if (wantedGroupKeys.size) {
+          // First, try allocations
           const allocs = Array.isArray(r?.allocations) ? r.allocations : [];
           let hit = false;
           for (const a of allocs) {
             const g = resolveToGroupName(a?.groupName || '');
             const k = keyOf(g);
-            if (k && wantedGroupKeys.has(k)) {
-              hit = true;
-              break;
+            if (k && wantedGroupKeys.has(k)) { hit = true; break; }
+          }
+          // If no allocations hit, also consider order lines (newly created deficit orders often have no allocations yet)
+          if (!hit) {
+            const lines = Array.isArray(r?.lines) ? r.lines : [];
+            for (const ln of lines) {
+              const g = resolveToGroupName(ln?.groupName || '');
+              const k = keyOf(g);
+              if (k && wantedGroupKeys.has(k)) { hit = true; break; }
             }
           }
           if (!hit) continue;

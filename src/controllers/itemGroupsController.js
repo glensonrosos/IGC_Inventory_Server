@@ -38,7 +38,7 @@ export const createItemGroup = async (req, res) => {
 
 export const updateItemGroup = async (req, res) => {
   const { id } = req.params || {};
-  const allowed = ['name', 'active', 'lineItem', 'price'];
+  const allowed = ['name', 'active', 'lineItem', 'price', 'palletName'];
   const updates = {};
   for (const k of allowed) if (k in req.body) updates[k] = req.body[k];
   if ('price' in updates) {
@@ -48,6 +48,10 @@ export const updateItemGroup = async (req, res) => {
   if (updates.name) {
     const exists = await ItemGroup.findOne({ _id: { $ne: id }, name: updates.name });
     if (exists) return res.status(409).json({ message: 'Item group already exists' });
+  }
+  if (typeof updates.palletName === 'string' && updates.palletName.trim()) {
+    const existsPN = await ItemGroup.findOne({ _id: { $ne: id }, palletName: updates.palletName.trim() });
+    if (existsPN) return res.status(409).json({ message: 'Pallet Name already exists' });
   }
   const doc = await ItemGroup.findByIdAndUpdate(id, { $set: updates }, { new: true });
   if (!doc) return res.status(404).json({ message: 'Item group not found' });
@@ -108,6 +112,9 @@ export const importItemGroups = async (req, res) => {
     if (!req.file || !req.file.buffer) {
       return res.status(400).json({ message: 'No file uploaded' });
     }
+
+    // Pallet Name DB uniqueness validation is performed after parsing header and rows,
+    // once groupByPalletName has been populated.
     const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
     const sheet = wb.Sheets[wb.SheetNames[0]];
     if (!sheet) return res.status(400).json({ message: 'No sheet found in workbook' });
@@ -115,16 +122,16 @@ export const importItemGroups = async (req, res) => {
     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
     if (!rows.length) return res.status(400).json({ message: 'Empty worksheet' });
 
-    const expectedHeaderNoPrice = ['Pallet Description', 'Pallet ID', 'Item Code', 'Item Description', 'Color', 'Pack Size'];
-    const expectedHeaderWithPrice = ['Pallet Description', 'Pallet ID', 'Price', 'Item Code', 'Item Description', 'Color', 'Pack Size'];
+    const expectedHeaderNoPrice = ['Pallet Name', 'Pallet Description', 'Pallet ID', 'Item Code', 'Item Description', 'Color', 'Pack Size'];
+    const expectedHeaderWithPrice = ['Pallet Name', 'Pallet Description', 'Pallet ID', 'Price', 'Item Code', 'Item Description', 'Color', 'Pack Size'];
     const normHeader = (h) => String(h || '').trim().toLowerCase();
     const receivedHeader = Array.isArray(rows[0]) ? rows[0].map(normHeader) : [];
     const expectedHeaderNoPriceNorm = expectedHeaderNoPrice.map(normHeader);
     const expectedHeaderWithPriceNorm = expectedHeaderWithPrice.map(normHeader);
-    const headerMatchesNoPrice = receivedHeader.length === expectedHeaderNoPriceNorm.length
-      && expectedHeaderNoPriceNorm.every((h, i) => receivedHeader[i] === h);
-    const headerMatchesWithPrice = receivedHeader.length === expectedHeaderWithPriceNorm.length
-      && expectedHeaderWithPriceNorm.every((h, i) => receivedHeader[i] === h);
+    // Relaxed: accept if all required headers are present anywhere in the header row
+    const hasAll = (need) => need.every((h) => receivedHeader.includes(h));
+    const headerMatchesNoPrice = hasAll(expectedHeaderNoPriceNorm);
+    const headerMatchesWithPrice = hasAll(expectedHeaderWithPriceNorm);
     const headerMatches = headerMatchesNoPrice || headerMatchesWithPrice;
     if (!headerMatches) {
       return res.status(400).json({
@@ -134,8 +141,9 @@ export const importItemGroups = async (req, res) => {
       });
     }
 
-    // Determine the index of the group name column, optional line item column, and optional item count column.
+    // Determine the index of the pallet name, group name column, optional line item column, and optional item count column.
     const header = rows[0].map((h) => String(h).trim().toLowerCase());
+    const palletNameIdx = header.findIndex((h) => ['pallet name','palletname'].includes(h));
     let nameIdx = header.findIndex((h) => ['group name', 'name', 'item group', 'itemgroup', 'pallet group', 'palletgroup', 'pallet description', 'palletdescription', 'description'].includes(h));
     if (nameIdx < 0) nameIdx = 0; // fallback: first column
     const lineItemIdx = header.findIndex((h) => ['line item','lineitem','line','pallet id','palletid','pallet'].includes(h));
@@ -151,7 +159,9 @@ export const importItemGroups = async (req, res) => {
     const seen = new Set();
     const rowsParsed = [];
     const lineItemByGroup = new Map(); // lower(groupName) -> lineItem string
+    const palletNameByGroup = new Map(); // lower(groupName) -> palletName string
     const groupByLineItem = new Map(); // lower(lineItem) -> lower(groupName)
+    const groupByPalletName = new Map(); // lower(palletName) -> lower(groupName)
     const priceByGroup = new Map(); // lower(groupName) -> number
     const errors = [];
 
@@ -161,6 +171,7 @@ export const importItemGroups = async (req, res) => {
       const row = rows[i];
       const rowNum = i + 1;
       const li = lineItemIdx >= 0 ? String(row[lineItemIdx] ?? '').trim() : '';
+      const pn = palletNameIdx >= 0 ? String(row[palletNameIdx] ?? '').trim() : '';
       const rawPrice = priceIdx >= 0 ? String(row[priceIdx] ?? '').trim() : '';
       const raw = (row[nameIdx] ?? '').toString().trim();
 
@@ -169,7 +180,7 @@ export const importItemGroups = async (req, res) => {
       const itemDescCell = itemDescIdx >= 0 ? String(row[itemDescIdx] ?? '').trim() : '';
       const itemColorCell = itemColorIdx >= 0 ? String(row[itemColorIdx] ?? '').trim() : '';
       const packCell = itemPackIdx >= 0 ? String(row[itemPackIdx] ?? '').trim() : '';
-      const anyOther = Boolean(li || rawPrice || itemCodeCell || itemDescCell || itemColorCell || packCell);
+      const anyOther = Boolean(li || pn || rawPrice || itemCodeCell || itemDescCell || itemColorCell || packCell);
       if (!raw) {
         if (anyOther) {
           errors.push({ rowNum, name: '-', errors: ['Pallet Description is required'] });
@@ -196,6 +207,30 @@ export const importItemGroups = async (req, res) => {
             priceByGroup.set(keyLower, p);
           }
         }
+      }
+
+      // Enforce Pallet Name uniqueness and consistency within the file
+      const pnLower = String(pn || '').trim().toLowerCase();
+      if (pnLower) {
+        if (groupByPalletName.has(pnLower)) {
+          const prevGroupLower = String(groupByPalletName.get(pnLower) || '').trim();
+          if (prevGroupLower && prevGroupLower !== keyLower) {
+            errors.push({ rowNum, name: raw, errors: ['Pallet Name must be unique (this Pallet Name is already used by another Pallet Description in the file)'] });
+          }
+        } else {
+          groupByPalletName.set(pnLower, keyLower);
+        }
+      }
+
+      // Track pallet name per group, and enforce consistency within the file
+      if (palletNameByGroup.has(keyLower)) {
+        const prevPN = palletNameByGroup.get(keyLower) || '';
+        if (pn && prevPN && prevPN.toLowerCase() !== pn.toLowerCase()) {
+          errors.push({ rowNum, name: raw, errors: ['Pallet Name must be the same for all rows of this Pallet Description in the file'] });
+        }
+        if (pn && !prevPN) palletNameByGroup.set(keyLower, pn);
+      } else {
+        palletNameByGroup.set(keyLower, pn);
       }
 
       // Enforce Pallet ID uniqueness within the file: a Pallet ID cannot map to multiple Pallet Descriptions.
@@ -229,7 +264,7 @@ export const importItemGroups = async (req, res) => {
       seen.add(key);
       const uploadedCount = countIdx >= 0 ? Number(row[countIdx]) : 0;
       const itemCount = Number.isFinite(uploadedCount) ? uploadedCount : 0;
-      rowsParsed.push({ name: raw, rowNum, itemCount, lineItem: li, price: priceByGroup.get(keyLower) });
+      rowsParsed.push({ name: raw, rowNum, itemCount, lineItem: li, palletName: pn, price: priceByGroup.get(keyLower) });
     }
 
     // Check existing names in DB
@@ -251,6 +286,24 @@ export const importItemGroups = async (req, res) => {
             rowNum: '-',
             name: g?.name,
             errors: [`Pallet ID must be unique (Pallet ID ${g?.lineItem} is already used by Pallet Description: ${g?.name})`],
+          });
+        }
+      }
+    }
+
+    // Enforce Pallet Name uniqueness against DB: a Pallet Name cannot belong to a different Pallet Description.
+    const importedPalletNames = Array.from(groupByPalletName.keys()).filter((v) => v);
+    if (importedPalletNames.length) {
+      const existingByPN = await ItemGroup.find({ palletName: { $in: importedPalletNames } }).select('name palletName').lean();
+      for (const g of existingByPN || []) {
+        const pnLower = String(g?.palletName || '').trim().toLowerCase();
+        const groupLower = String(g?.name || '').trim().toLowerCase();
+        const importedGroupLower = String(groupByPalletName.get(pnLower) || '').trim();
+        if (pnLower && importedGroupLower && importedGroupLower !== groupLower) {
+          errors.push({
+            rowNum: '-',
+            name: g?.name,
+            errors: [`Pallet Name must be unique (Pallet Name ${g?.palletName} is already used by Pallet Description: ${g?.name})`],
           });
         }
       }
@@ -298,7 +351,16 @@ export const importItemGroups = async (req, res) => {
         if (!itemCode) missingRequired('Item Code', rowNum, rawName);
         const desc = itemDescIdx >= 0 ? (row[itemDescIdx] ?? '').toString().trim() : '';
         const color = itemColorIdx >= 0 ? (row[itemColorIdx] ?? '').toString().trim() : '';
-        const packVal = itemPackIdx >= 0 ? Number(String(row[itemPackIdx]).toString().trim()) : NaN;
+        let packVal = NaN;
+        if (itemPackIdx >= 0) {
+          const rawPack = (row[itemPackIdx] ?? '').toString().trim();
+          if (rawPack === '') {
+            packVal = 0; // treat blank pack size as 0
+          } else {
+            const parsed = Number(rawPack);
+            packVal = parsed;
+          }
+        }
 
         if (!desc) missingRequired('Item Description', rowNum, rawName);
         if (!color) missingRequired('Color', rowNum, rawName);
@@ -326,7 +388,7 @@ export const importItemGroups = async (req, res) => {
           errors.push({ rowNum: r.rowNum, itemCode: r.itemCode, itemGroup: gdoc.name, errors: ['Pallet ID must be the same for all rows of this Pallet Description in the file'] });
           continue;
         }
-        if (!Number.isFinite(r.packSize)) { errors.push({ rowNum: r.rowNum, itemCode: r.itemCode, errors: ['Pack Size required'] }); continue; }
+        if (!Number.isFinite(r.packSize)) { errors.push({ rowNum: r.rowNum, itemCode: r.itemCode, errors: ['Pack Size must be a valid number (or leave blank for 0)'] }); continue; }
         if (r.packSize < 0) { errors.push({ rowNum: r.rowNum, itemCode: r.itemCode, errors: ['Pack Size must be >= 0'] }); continue; }
         const key = `${gdoc.name.toLowerCase()}|${r.itemCode.toLowerCase()}`;
         if (!byKey.has(key)) {
@@ -397,7 +459,7 @@ export const importItemGroups = async (req, res) => {
 
     // Perform writes only when there are no validation errors
     const createdDocs = await ItemGroup.insertMany(
-      toCreate.map((r) => ({ name: r.name, lineItem: (r.lineItem || '').trim(), price: typeof r.price === 'number' ? r.price : undefined })),
+      toCreate.map((r) => ({ name: r.name, palletName: (r.palletName || '').trim(), lineItem: (r.lineItem || '').trim(), price: typeof r.price === 'number' ? r.price : undefined })),
       { ordered: false }
     ).catch(() => []);
 
@@ -406,6 +468,8 @@ export const importItemGroups = async (req, res) => {
         await ItemGroup.updateOne({ _id: op.id }, { $set: { lineItem: op.lineItem } });
       } else if (op.type === 'updatePrice') {
         await ItemGroup.updateOne({ _id: op.id }, { $set: { price: op.price } });
+      } else if (op.type === 'updatePalletName') {
+        await ItemGroup.updateOne({ _id: op.id }, { $set: { palletName: op.palletName } });
       } else if (op.type === 'updateItem') {
         await Item.updateOne({ _id: op.id }, { $set: op.changes });
       } else if (op.type === 'createItem') {
