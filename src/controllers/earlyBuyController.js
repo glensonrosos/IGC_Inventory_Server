@@ -23,6 +23,7 @@ export const updateEarlyBuy = async (req, res) => {
   const idParam = String(req.params.id || '').trim();
   if (!idParam) return res.status(400).json({ message: 'Missing order id' });
   const b = req.body || {};
+  const updatedBy = String(req.user?.username || req.user?.name || req.user?.email || '').trim();
   const required = ['customerEmail','customerName','customerPhone','shippingAddress','createdAt'];
   for (const k of required) {
     if (!String(b[k] || '').trim()) {
@@ -48,6 +49,7 @@ export const updateEarlyBuy = async (req, res) => {
 
   const update = {
     status: String(b.status || 'processing').trim().toLowerCase(),
+    ...(updatedBy ? { updatedBy } : {}),
     warehouseId: 'MPG',
     createdAtYmd: createdAt,
     estFulfillment,
@@ -75,6 +77,7 @@ export const updateEarlyBuy = async (req, res) => {
 
 export const createEarlyBuy = async (req, res) => {
   const b = req.body || {};
+  const updatedBy = String(req.user?.username || req.user?.name || req.user?.email || '').trim();
   const required = ['customerEmail','customerName','customerPhone','shippingAddress','createdAt'];
   for (const k of required) {
     if (!String(b[k] || '').trim()) {
@@ -98,6 +101,7 @@ export const createEarlyBuy = async (req, res) => {
   const doc = await EarlyBuyOrder.create({
     id,
     status: String(b.status || 'processing').trim().toLowerCase(),
+    ...(updatedBy ? { updatedBy } : {}),
     warehouseId: 'MPG',
     createdAtYmd: createdAt,
     estFulfillment,

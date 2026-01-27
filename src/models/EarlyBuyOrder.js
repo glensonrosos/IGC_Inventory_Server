@@ -19,6 +19,7 @@ const earlyBuyOrderSchema = new mongoose.Schema(
       default: 'processing',
       index: true,
     },
+    updatedBy: { type: String, default: '', trim: true },
     warehouseId: { type: String, default: '', trim: true },
     createdAtYmd: { type: String, required: true }, // YYYY-MM-DD (local date as string)
     estFulfillment: { type: String, default: '' },
