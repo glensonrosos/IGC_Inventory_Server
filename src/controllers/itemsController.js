@@ -30,11 +30,11 @@ export const createItem = async (req, res) => {
   if (packSize != null && Number(packSize) < 0) return res.status(400).json({ message: 'packSize must be >= 0' });
   if (itemGroup) {
     const groupDoc = await ItemGroup.findOne({ name: itemGroup }).lean();
-    if (!groupDoc) return res.status(400).json({ message: 'Pallet Description not found' });
-    if (groupDoc.active === false) return res.status(400).json({ message: 'Pallet Description is inactive' });
+    if (!groupDoc) return res.status(400).json({ message: 'Pallet Group not found' });
+    if (groupDoc.active === false) return res.status(400).json({ message: 'Pallet Group is inactive' });
   }
   const exists = await Item.findOne({ itemCode, itemGroup: itemGroup || '' });
-  if (exists) return res.status(409).json({ message: 'Item already exists in this pallet description' });
+  if (exists) return res.status(409).json({ message: 'Item already exists in this pallet group' });
   const doc = await Item.create({
     itemCode,
     itemGroup: itemGroup || '',
@@ -116,7 +116,7 @@ export const importItemsExcel = async (req, res) => {
       if (Number(r.packSize) < 0) { errors.push({ rowNum: r.rowNum, itemCode: r.itemCode, errors: ['Pack Size must be >= 0'] }); skipped++; continue; }
       if (!groupSet.has(r.itemGroup)) {
         const found = existingGroups.find(g=>g.name===r.itemGroup);
-        const reason = found && found.active === false ? 'Item Group is inactive' : 'Item Group not registered';
+        const reason = found && found.active === false ? 'Pallet Group is inactive' : 'Pallet Group not registered';
         errors.push({ rowNum: r.rowNum, itemCode: r.itemCode, errors: [reason] }); skipped++; continue; }
       const key = `${r.itemGroup.toLowerCase()}|${r.itemCode.toLowerCase()}`;
       if (!byKey.has(key)) {
