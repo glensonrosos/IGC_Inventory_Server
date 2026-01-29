@@ -42,7 +42,13 @@ export const listShipments = async (req, res) => {
     const regex = { $regex: toWsRegex(qPallet), $options: 'i' };
     let groupNameRegex = null;
     try {
-      const groups = await ItemGroup.find({ lineItem: { $regex: toWsRegex(qPallet), $options: 'i' } }).select('name').lean();
+      const groups = await ItemGroup.find({
+        $or: [
+          { lineItem: { $regex: toWsRegex(qPallet), $options: 'i' } },
+          { palletDescription: { $regex: toWsRegex(qPallet), $options: 'i' } },
+          { palletName: { $regex: toWsRegex(qPallet), $options: 'i' } },
+        ]
+      }).select('name').lean();
       const names = (groups || [])
         .map((g) => String(g?.name || '').trim())
         .filter((s) => s);

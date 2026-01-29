@@ -18,7 +18,7 @@ export const importPreview = async (req, res) => {
   const rawRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
   if (!rawRows.length) return res.status(400).json({ message: 'Empty worksheet' });
 
-  const expectedHeader = ['PO #', 'Pallet Description', 'Total Pallet'];
+  const expectedHeader = ['PO #', 'Pallet Name', 'Total Pallet'];
   const normHeader = (h) => String(h || '').trim().toLowerCase();
   const receivedHeader = Array.isArray(rawRows[0]) ? rawRows[0].map(normHeader) : [];
   const expectedHeaderNorm = expectedHeader.map(normHeader);
@@ -42,33 +42,37 @@ export const importPreview = async (req, res) => {
     const r = rows[i];
     const rowNum = i + 2; // header row is 1
     const poNumber = normalizeStr(r['PO #']);
-    const groupName = normalizeStr(r['Pallet Description'] ?? r['Pallet Group']);
+    const palletName = normalizeStr(r['Pallet Name'] ?? r['Pallet name'] ?? r['Pallet']);
     const pallets = Number(r['Total Pallet']);
     const rowErrors = [];
     if (!poNumber) rowErrors.push('PO # required');
-    if (!groupName) rowErrors.push('Pallet Description required');
+    if (!palletName) rowErrors.push('Pallet Name required');
     if (!Number.isFinite(pallets) || pallets <= 0) rowErrors.push('Total Pallet must be > 0');
-    const key = `${poNumber}||${groupName}`;
-    if (seen.has(key)) rowErrors.push('Duplicate PO # + Pallet Description');
+    const key = `${poNumber}||${palletName}`;
+    if (seen.has(key)) rowErrors.push('Duplicate PO # + Pallet Name');
     seen.add(key);
-    // Validate pallet group registered and active
-    const grp = groupName ? await ItemGroup.findOne({ name: groupName, active: true }).lean() : null;
-    if (groupName && !grp) rowErrors.push('Pallet Description not registered or inactive');
+    // Validate pallet group registered and active (Pallet Name is globally unique)
+    const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const grp = palletName
+      ? await ItemGroup.findOne({ palletName: new RegExp(`^${escapeRegex(palletName)}$`, 'i'), active: true }).select('name').lean()
+      : null;
+    const groupName = grp?.name ? String(grp.name) : '';
+    if (palletName && !grp) rowErrors.push('Pallet Name not registered or inactive');
     // Check duplicate existing transaction for same PO# + Group + Warehouse
     if (poNumber && groupName && warehouseId) {
       const exists = await PalletGroupTxn.findOne({ poNumber, groupName, warehouseId }).lean();
-      if (exists) rowErrors.push('Duplicate: PO # + Pallet Description already imported for this Warehouse');
+      if (exists) rowErrors.push('Duplicate: PO # + Pallet Name already imported for this Warehouse');
     }
     // Also block duplicates across ANY warehouse as requested
     if (poNumber && groupName) {
       const existsAny = await PalletGroupTxn.findOne({ poNumber, groupName }).lean();
-      if (existsAny) rowErrors.push('Duplicate: PO # + Pallet Description already imported (any warehouse)');
+      if (existsAny) rowErrors.push('Duplicate: PO # + Pallet Name already imported (any warehouse)');
     }
     if (rowErrors.length) {
       errors.push({ rowNum, errors: rowErrors });
       continue;
     }
-    parsed.push({ poNumber, groupName, pallets });
+    parsed.push({ poNumber, palletName, groupName, pallets });
   }
 
   res.json({ totalRows, errorCount: errors.length, errors, duplicateCount: totalRows - parsed.length, rows: parsed });
@@ -87,7 +91,7 @@ export const importCommit = async (req, res) => {
   const rawRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
   if (!rawRows.length) return res.status(400).json({ message: 'Empty worksheet' });
 
-  const expectedHeader = ['PO #', 'Pallet Description', 'Total Pallet'];
+  const expectedHeader = ['PO #', 'Pallet Name', 'Total Pallet'];
   const normHeader = (h) => String(h || '').trim().toLowerCase();
   const receivedHeader = Array.isArray(rawRows[0]) ? rawRows[0].map(normHeader) : [];
   const expectedHeaderNorm = expectedHeader.map(normHeader);
@@ -109,19 +113,26 @@ export const importCommit = async (req, res) => {
     const r = rows[i];
     const rowNum = i + 2;
     const poNumber = normalizeStr(r['PO #']);
-    const groupName = normalizeStr(r['Pallet Description'] ?? r['Pallet Group']);
+    const palletName = normalizeStr(r['Pallet Name'] ?? r['Pallet name'] ?? r['Pallet']);
     const pallets = Number(r['Total Pallet']);
     const rowErrors = [];
     if (!poNumber) rowErrors.push('PO # required');
-    if (!groupName) rowErrors.push('Pallet Description required');
+    if (!palletName) rowErrors.push('Pallet Name required');
     if (!Number.isFinite(pallets) || pallets <= 0) rowErrors.push('Total Pallet must be > 0');
     if (rowErrors.length) { errors.push({ rowNum, errors: rowErrors }); continue; }
 
+    const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const grp = palletName
+      ? await ItemGroup.findOne({ palletName: new RegExp(`^${escapeRegex(palletName)}$`, 'i'), active: true }).select('name').lean()
+      : null;
+    const groupName = grp?.name ? String(grp.name) : '';
+    if (palletName && !grp) { errors.push({ rowNum, errors: ['Pallet Name not registered or inactive'] }); continue; }
+
     try {
       const exists = await PalletGroupTxn.findOne({ poNumber, groupName, warehouseId });
-      if (exists) { errors.push({ rowNum, errors: ['Duplicate entry for same PO # + Pallet Description + Warehouse'] }); continue; }
+      if (exists) { errors.push({ rowNum, errors: ['Duplicate entry for same PO # + Pallet Name + Warehouse'] }); continue; }
       const existsAny = await PalletGroupTxn.findOne({ poNumber, groupName });
-      if (existsAny) { errors.push({ rowNum, errors: ['Duplicate entry for same PO # + Pallet Description (any warehouse)'] }); continue; }
+      if (existsAny) { errors.push({ rowNum, errors: ['Duplicate entry for same PO # + Pallet Name (any warehouse)'] }); continue; }
 
       await PalletGroupTxn.create({
         poNumber,
@@ -167,7 +178,7 @@ export const importCommit = async (req, res) => {
       }
     } catch (e) {
       const msg = (e && e.code === 11000)
-        ? 'Duplicate entry for same PO # + Pallet Description + Warehouse'
+        ? 'Duplicate entry for same PO # + Pallet Name + Warehouse'
         : (e?.message || 'Unexpected error');
       errors.push({ rowNum, errors: [msg] });
     }

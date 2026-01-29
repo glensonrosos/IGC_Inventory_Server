@@ -210,23 +210,24 @@ export const updateBatchItems = async (req, res) => {
     const resu = await OnProcessItem.updateOne({ batchId: id, itemCode }, { $set: update });
     updated += resu.modifiedCount || 0;
   }
-  res.json({ updated });
+
+  res.json({ ok: true, updated });
 };
 
 export const exportBatch = async (req, res) => {
   const { id } = req.params;
-  const batch = await OnProcessBatch.findById(id).lean();
+  const batch = await OnProcessBatch.findById(id);
   if (!batch) return res.status(404).json({ message: 'batch not found' });
   // Export Pallet list with batch metadata
   const pallets = await OnProcessPallet.find({ batchId: id }).sort({ createdAt: 1 }).lean();
-  const header = ['Pallet Description','Total Pallet','Finished','Transferred','Remaining','Status','Notes'];
+  const header = ['Pallet Group','Total Pallet','Finished','Transferred','Remaining','Status','Notes'];
   const data = [];
   // metadata rows
   data.push(['Reference', batch.reference]);
   data.push(['PO #', batch.poNumber]);
   data.push(['Status', batch.status]);
-  data.push(['Estimated Date Finish', batch.estFinishDate ? new Date(batch.estFinishDate).toISOString().slice(0,10) : '']);
-  data.push(['Notes/Remarks', batch.notes || '']);
+  data.push(['Est Finish', batch.estFinishDate ? new Date(batch.estFinishDate).toISOString().slice(0, 10) : '']);
+  data.push(['Notes', batch.notes || '']);
   data.push([]);
   data.push(header);
   for (const p of pallets) {
@@ -250,8 +251,6 @@ export const exportBatch = async (req, res) => {
   res.send(buf);
 };
 
-// ===================== PALLET-GROUP (ON-PROCESS) =====================
-
 export const importOnProcessPallets = async (req, res) => {
   try {
     if (!req.file || !req.file.buffer) return res.status(400).json({ message: 'No file uploaded' });
@@ -262,7 +261,7 @@ export const importOnProcessPallets = async (req, res) => {
     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
     if (!rows.length) return res.status(400).json({ message: 'Empty worksheet' });
 
-    const expectedHeader = ['PO #', 'Pallet Description', 'Total Pallet'];
+    const expectedHeader = ['PO #', 'Pallet Name', 'Total Pallet'];
     const normHeader = (h) => String(h || '').trim().toLowerCase();
     const receivedHeader = Array.isArray(rows[0]) ? rows[0].map(normHeader) : [];
     const expectedHeaderNorm = expectedHeader.map(normHeader);
@@ -278,8 +277,15 @@ export const importOnProcessPallets = async (req, res) => {
 
     const header = rows[0].map(h => String(h).trim().toLowerCase());
     const poIdx = header.findIndex(h => ['po #','po','po#','po number','ponumber'].includes(h));
-    const groupIdx = header.findIndex(h => ['pallet description','palletdescription','description','pallet group','palletgroup','group','group name','pallet'].includes(h));
+    const groupIdx = header.findIndex(h => ['pallet name','palletname','pallet','pallet group','palletgroup','group','group name'].includes(h));
     const totalIdx = header.findIndex(h => ['total pallet','total pallets','pallets','total'].includes(h));
+
+    const allGroups = await ItemGroup.find({}).select('name palletName active').lean();
+    const byPalletName = new Map(
+      (Array.isArray(allGroups) ? allGroups : [])
+        .map((g) => [String(g?.palletName || '').trim().toLowerCase(), g])
+        .filter(([k]) => k)
+    );
 
     const errors = [];
     const parsed = [];
@@ -288,27 +294,23 @@ export const importOnProcessPallets = async (req, res) => {
       const row = rows[i];
       const rowNum = i + 1;
       const poNumber = (row[poIdx] ?? '').toString().trim();
-      const groupName = (row[groupIdx] ?? '').toString().trim();
+      const palletName = (row[groupIdx] ?? '').toString().trim();
       const totalPallet = Number(row[totalIdx]);
       const rowErrs = [];
       if (!poNumber) rowErrs.push('PO# is required');
-      if (!groupName) rowErrs.push('Pallet Description is required');
+      if (!palletName) rowErrs.push('Pallet Name is required');
       if (!Number.isFinite(totalPallet) || totalPallet <= 0) rowErrs.push('Total Pallet must be > 0');
-      if (rowErrs.length) { errors.push({ rowNum, poNumber, groupName, errors: rowErrs }); continue; }
-      const key = `${poNumber}::${groupName}`.toLowerCase();
-      if (seen.has(key)) { errors.push({ rowNum, poNumber, groupName, errors: ['Duplicate PO# + Pallet Description in file'] }); continue; }
-      seen.add(key);
-      parsed.push({ rowNum, poNumber, groupName, totalPallet });
-    }
+      if (rowErrs.length) { errors.push({ rowNum, poNumber, palletName, errors: rowErrs }); continue; }
 
-    // validate groups are registered and active
-    const groups = Array.from(new Set(parsed.map(r => r.groupName)));
-    const found = await ItemGroup.find({ name: { $in: groups } }).select('name active').lean();
-    const map = new Map(found.map(f => [f.name, f]));
-    for (const r of parsed) {
-      const g = map.get(r.groupName);
-      if (!g) errors.push({ rowNum: r.rowNum, poNumber: r.poNumber, groupName: r.groupName, errors: ['pallet description not registered'] });
-      else if (g.active === false) errors.push({ rowNum: r.rowNum, poNumber: r.poNumber, groupName: r.groupName, errors: ['pallet description is inactive'] });
+      const foundGroup = byPalletName.get(String(palletName || '').trim().toLowerCase()) || null;
+      const groupName = foundGroup?.name ? String(foundGroup.name).trim() : '';
+      if (!foundGroup) { errors.push({ rowNum, poNumber, palletName, errors: ['Pallet Name not registered'] }); continue; }
+      if (foundGroup.active === false) { errors.push({ rowNum, poNumber, palletName, errors: ['Pallet Name is inactive'] }); continue; }
+
+      const key = `${poNumber}::${groupName}`.toLowerCase();
+      if (seen.has(key)) { errors.push({ rowNum, poNumber, palletName, groupName, errors: ['Duplicate PO# + Pallet Name in file'] }); continue; }
+      seen.add(key);
+      parsed.push({ rowNum, poNumber, palletName, groupName, totalPallet });
     }
 
     // check duplicates existing
@@ -316,7 +318,7 @@ export const importOnProcessPallets = async (req, res) => {
     const existSet = new Set(exist.map(e => `${e.poNumber}::${e.groupName}`.toLowerCase()));
     for (const r of parsed) {
       if (existSet.has(`${r.poNumber}::${r.groupName}`.toLowerCase())) {
-        errors.push({ rowNum: r.rowNum, poNumber: r.poNumber, groupName: r.groupName, errors: ['Already exists in On-Process pallets'] });
+        errors.push({ rowNum: r.rowNum, poNumber: r.poNumber, palletName: r.palletName, groupName: r.groupName, errors: ['Already exists in On-Process pallets'] });
       }
     }
 
@@ -327,9 +329,10 @@ export const importOnProcessPallets = async (req, res) => {
       const docs = [];
       for (const po of Object.keys(byPo)) {
         let batch = await OnProcessBatch.findOne({ poNumber: po });
+        // On successful import, set/refresh Estimated Date Finish to today + 2 months
+        const d = new Date();
+        d.setMonth(d.getMonth() + 2);
         if (!batch) {
-          const d = new Date();
-          d.setMonth(d.getMonth() + 2);
           const c = await Counter.findOneAndUpdate(
             { name: 'on_process' },
             { $inc: { seq: 1 } },
@@ -337,9 +340,7 @@ export const importOnProcessPallets = async (req, res) => {
           );
           const ref = `PROC-${String(c.seq).padStart(6, '0')}`;
           batch = await OnProcessBatch.create({ poNumber: po, reference: ref, estFinishDate: d, createdBy: req.user?.id });
-        } else if (!batch.estFinishDate) {
-          const d = new Date();
-          d.setMonth(d.getMonth() + 2);
+        } else {
           batch.estFinishDate = d;
           await batch.save();
         }
@@ -364,7 +365,6 @@ export const getBatchPallets = async (req, res) => {
   const toUnlockIds = [];
   const mapped = rows.map(r => {
     const remainingPallet = Math.max(0, (r.totalPallet || 0) - ((r.transferredPallet || 0) + (r.finishedPallet || 0)));
-    // If there is remaining work, the row should not stay locked.
     if (r.locked && remainingPallet > 0) {
       toUnlockIds.push(r._id);
     }
@@ -382,19 +382,11 @@ export const getBatchPallets = async (req, res) => {
   res.json(mapped);
 };
 
-// Fetch on-process pallets by PO number directly
 export const listPalletsByPo = async (req, res) => {
-  const po = String(req.query.po || '').trim();
-  if (!po) return res.status(400).json({ message: 'po is required' });
-  const rows = await OnProcessPallet.find({ poNumber: po }).sort({ createdAt: 1 }).lean();
-  const mapped = rows.map(r => ({
-    groupName: r.groupName,
-    totalPallet: r.totalPallet,
-    finishedPallet: r.finishedPallet || 0,
-    transferredPallet: r.transferredPallet || 0,
-    status: r.status || 'in_progress',
-  }));
-  res.json(mapped);
+  const poNumber = String(req.query.poNumber || req.query.po || req.query['PO #'] || '').trim();
+  if (!poNumber) return res.status(400).json({ message: 'poNumber required' });
+  const rows = await OnProcessPallet.find({ poNumber }).sort({ createdAt: 1 }).lean();
+  res.json(rows);
 };
 
 export const updateBatchPallets = async (req, res) => {
@@ -402,99 +394,86 @@ export const updateBatchPallets = async (req, res) => {
   const { pallets } = req.body || {};
   if (!Array.isArray(pallets)) return res.status(400).json({ message: 'pallets required' });
   let updated = 0;
-  let skippedLocked = 0;
-  let skippedCancelWithTransfer = 0;
-  const touchedGroups = new Set();
   for (const p of pallets) {
-    const { groupName, finishedPallet, totalPallet, status, notes } = p || {};
+    const groupName = String(p?.groupName || '').trim();
     if (!groupName) continue;
-    touchedGroups.add(String(groupName));
-    // Load doc to respect locking
+
     const doc = await OnProcessPallet.findOne({ batchId: id, groupName });
     if (!doc) continue;
-    if (doc.locked) {
-      // Locked rows: allow ONLY increasing totalPallet (never decreasing), since transferred is already committed.
-      // Ignore all other updates.
-      if (Number.isFinite(totalPallet) && totalPallet > 0) {
-        const transferred = Math.max(0, doc.transferredPallet || 0);
-        const prevTotal = Math.max(0, doc.totalPallet || 0);
-        const nextTotal = Math.max(prevTotal, transferred, Number(totalPallet));
-        if (nextTotal > prevTotal) {
-          await OnProcessPallet.updateOne(
-            { _id: doc._id },
-            {
-              $set: {
-                totalPallet: nextTotal,
-                status: 'in_progress',
-                locked: false,
-              },
-            }
-          );
-          updated += 1;
-        } else {
-          skippedLocked += 1;
-        }
-      } else {
-        skippedLocked += 1;
-      }
-      continue;
+    const currentTotal = Math.max(0, Number(doc.totalPallet || 0));
+    const currentTransferred = Math.max(0, Number(doc.transferredPallet || 0));
+    const incomingTotal = p?.totalPallet !== undefined ? Math.max(0, Math.floor(Number(p.totalPallet) || 0)) : null;
+    const proposedTotal = incomingTotal === null ? currentTotal : incomingTotal;
+    const fullyTransferred = currentTotal > 0 && currentTransferred >= currentTotal;
+    // Allow increasing total even if currently fully transferred.
+    // Block only when fully transferred AND caller is not increasing total beyond transferred.
+    if (fullyTransferred && !(proposedTotal > currentTransferred)) continue;
+    // Clear stale lock flags from older logic (previously locked when remaining==0)
+    if (doc.locked) doc.locked = false;
+
+    if (p.totalPallet !== undefined) {
+      doc.totalPallet = proposedTotal;
     }
-    const update = {};
-    if (Number.isFinite(finishedPallet) && finishedPallet >= 0) {
-      const maxFinish = Math.max(0, (doc.totalPallet || 0) - (doc.transferredPallet || 0));
-      update.finishedPallet = Math.min(finishedPallet, maxFinish);
+    if (p.finishedPallet !== undefined) {
+      const nextFinished = Math.max(0, Math.floor(Number(p.finishedPallet) || 0));
+      doc.finishedPallet = nextFinished;
     }
-    if (Number.isFinite(totalPallet) && totalPallet > 0) {
-      // Ensure total cannot be set below already transferred
-      const minTotal = Math.max(0, doc.transferredPallet || 0);
-      update.totalPallet = Math.max(totalPallet, minTotal);
-      // Also cap current finished against new total
-      const newMaxFinish = Math.max(0, (update.totalPallet || doc.totalPallet || 0) - (doc.transferredPallet || 0));
-      if (update.finishedPallet == null) update.finishedPallet = Math.min(doc.finishedPallet || 0, newMaxFinish);
-      else update.finishedPallet = Math.min(update.finishedPallet, newMaxFinish);
-    }
-    if (typeof status === 'string') {
-      if (status === 'cancelled' && (doc.transferredPallet || 0) > 0) {
-        skippedCancelWithTransfer += 1;
-      } else {
-        update.status = status;
+    if (p.status) {
+      const st = String(p.status);
+      if (['in_progress', 'partial', 'completed', 'cancelled'].includes(st)) {
+        doc.status = st;
       }
     }
-    if (typeof notes === 'string') update.notes = notes;
-    const resu = await OnProcessPallet.updateOne({ _id: doc._id }, { $set: update });
-    updated += resu.modifiedCount || 0;
+
+    // Enforce invariant: total >= transferred + finished
+    let total = Math.max(0, doc.totalPallet || 0);
+    const transferred = Math.max(0, doc.transferredPallet || 0);
+    let finished = Math.max(0, doc.finishedPallet || 0);
+    if (total < transferred + finished) {
+      total = transferred + finished;
+      doc.totalPallet = total;
+    }
+
+    // Finished must not exceed (total - transferred)
+    const maxFinished = Math.max(0, total - transferred);
+    if (finished > maxFinished) {
+      finished = maxFinished;
+      doc.finishedPallet = finished;
+    }
+    doc.finishedPallet = finished;
+
+    const remaining = Math.max(0, total - (transferred + finished));
+    if (doc.status !== 'cancelled') {
+      doc.status = remaining === 0 ? 'completed' : (finished > 0 ? 'partial' : 'in_progress');
+    }
+    // Lock only when fully transferred (not merely remaining==0 due to finished)
+    doc.locked = total > 0 && transferred >= total;
+
+    await doc.save();
+    updated += 1;
   }
-  // Best-effort: trigger order rebalancing for affected pallet groups so Orders table adopts new tier availability
-  try {
-    if (touchedGroups.size) {
-      await rebalanceProcessingOrdersInternal({ groupNames: Array.from(touchedGroups) });
-    }
-  } catch {}
-  res.json({ updated, skippedLocked, skippedCancelWithTransfer });
+  res.json({ ok: true, updated });
 };
 
 export const addBatchPallet = async (req, res) => {
   const { id } = req.params;
-  const { groupName, totalPallet } = req.body || {};
+  const { groupName, totalPallet } = req.body;
   if (!groupName || !Number.isFinite(totalPallet) || totalPallet <= 0) return res.status(400).json({ message: 'groupName and totalPallet (>0) required' });
   const batch = await OnProcessBatch.findById(id);
   if (!batch) return res.status(404).json({ message: 'batch not found' });
   // validate not duplicate and group exists/active
   const exists = await OnProcessPallet.findOne({ poNumber: batch.poNumber, groupName });
-  if (exists) return res.status(400).json({ message: 'pallet description already exists for this PO#' });
+  if (exists) return res.status(400).json({ message: 'pallet name already exists for this PO#' });
   const grp = await ItemGroup.findOne({ name: groupName, active: true }).lean();
-  if (!grp) return res.status(400).json({ message: 'pallet description not registered or inactive' });
+  if (!grp) return res.status(400).json({ message: 'pallet name not registered or inactive' });
   const doc = await OnProcessPallet.create({
     batchId: batch._id,
     poNumber: batch.poNumber,
     groupName,
-    totalPallet,
-    finishedPallet: 0,
-    transferredPallet: 0,
-    status: 'in_progress',
+    totalPallet: Number(totalPallet) || 0,
     createdBy: req.user?.id,
   });
-  res.status(201).json(doc);
+  res.json(doc);
 };
 
 export const transferBatchPallets = async (req, res) => {
