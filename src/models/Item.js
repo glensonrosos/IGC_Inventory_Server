@@ -6,6 +6,8 @@ const itemSchema = new mongoose.Schema(
     itemGroup: { type: String, default: '' },
     description: { type: String, default: '' },
     color: { type: String, default: '' },
+    upc: { type: String, default: '', trim: true },
+    price: { type: Number, default: 0 },
     totalQty: { type: Number, required: true, default: 0 },
     packSize: { type: Number, required: true, default: 1 },
     packsOnHand: { type: Number, default: 0 },

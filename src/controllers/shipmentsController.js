@@ -10,6 +10,7 @@ import Item from '../models/Item.js';
 import StockMovement from '../models/StockMovement.js';
 import ImportLog from '../models/ImportLog.js';
 import Counter from '../models/Counter.js';
+import { rebalanceProcessingOrdersInternal } from './ordersController.js';
 
 export const listShipments = async (req, res) => {
   const { status } = req.query;
@@ -375,14 +376,22 @@ export const deliverShipment = async (req, res) => {
 
   let resolveToGroupName = (raw) => String(raw || '').trim();
   try {
-    const groups = await ItemGroup.find({ active: true }).select('name lineItem').lean();
+    const groups = await ItemGroup.find({ active: true }).select('name lineItem palletName palletDescription').lean();
     const byGroupKey = new Map((groups || []).map((g) => [keyOf(g?.name || ''), String(g?.name || '').trim()]));
     const byLineItemKey = new Map((groups || []).map((g) => [keyOf(g?.lineItem || ''), String(g?.name || '').trim()]));
+    const byPalletNameKey = new Map((groups || []).map((g) => [keyOf(g?.palletName || ''), String(g?.name || '').trim()]));
+    const byPalletDescKey = new Map((groups || []).map((g) => [keyOf(g?.palletDescription || ''), String(g?.name || '').trim()]));
     resolveToGroupName = (raw) => {
       const s = String(raw || '').trim();
       if (!s) return '';
       const k = keyOf(s);
-      return byGroupKey.get(k) || byLineItemKey.get(k) || s;
+      return (
+        byGroupKey.get(k) ||
+        byLineItemKey.get(k) ||
+        byPalletNameKey.get(k) ||
+        byPalletDescKey.get(k) ||
+        s
+      );
     };
   } catch {
     // best-effort
@@ -437,6 +446,7 @@ export const deliverShipment = async (req, res) => {
   };
 
   // apply to destination warehouse (legacy item transfers + imports)
+  const changedGroups = new Set();
   for (const it of ship.items) {
     const { itemCode, qtyPieces } = it;
     await WarehouseStock.findOneAndUpdate(
@@ -495,6 +505,7 @@ export const deliverShipment = async (req, res) => {
         committedAt: now,
       });
       await migrateOnWaterToPrimary({ warehouseId: ship.warehouseId, groupName, pallets });
+      changedGroups.add(groupName);
       // lock matching on-process pallets for this PO/group that are fully completed
       await OnProcessPallet.updateMany(
         { poNumber: ship.reference, groupName, status: 'completed', locked: { $ne: true } },
@@ -529,6 +540,7 @@ export const deliverShipment = async (req, res) => {
           committedBy: 'transfer',
         });
         await migrateOnWaterToPrimary({ warehouseId: ship.warehouseId, groupName, pallets });
+        changedGroups.add(groupName);
       }
     } else {
       // legacy item-stock transfer behavior
@@ -559,6 +571,16 @@ export const deliverShipment = async (req, res) => {
   const isPalletTransfer = ship.kind === 'transfer' && /pallet-group:/i.test(String(ship.notes || ''));
   ship.status = ship.kind === 'transfer' ? (isPalletTransfer ? 'delivered' : 'transferred') : 'delivered';
   await ship.save();
+  // Best-effort: proactively rebalance any processing orders impacted by these pallet groups in this warehouse
+  try {
+    const warehouseId = String(ship.warehouseId || '').trim();
+    const groups = Array.from(changedGroups.values());
+    if (warehouseId && groups.length) {
+      await rebalanceProcessingOrdersInternal({ warehouseId, groupNames: groups });
+    }
+  } catch (e) {
+    // ignore failures here; front-end also triggers a rebalance
+  }
   res.json({ message: 'delivered', shipment: ship });
 };
 

@@ -6,6 +6,7 @@ const lineSchema = new mongoose.Schema(
     lineItem: { type: String, required: true, trim: true },
     palletName: { type: String, default: '', trim: true },
     qty: { type: Number, required: true, min: 0 },
+    discountPercent: { type: Number, default: 0, min: 0, max: 100 },
   },
   { _id: false }
 );
@@ -22,6 +23,7 @@ const earlyBuyOrderSchema = new mongoose.Schema(
     updatedBy: { type: String, default: '', trim: true },
     warehouseId: { type: String, default: '', trim: true },
     createdAtYmd: { type: String, required: true }, // YYYY-MM-DD (local date as string)
+    containerArrival: { type: String, default: '' },
     estFulfillment: { type: String, default: '' },
     estDelivered: { type: String, default: '' },
     customerEmail: { type: String, required: true },

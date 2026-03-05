@@ -6,6 +6,7 @@ import PalletGroupStock from '../models/PalletGroupStock.js';
 import OnProcessPallet from '../models/OnProcessPallet.js';
 import PalletGroupTxn from '../models/PalletGroupTxn.js';
 import ItemGroup from '../models/ItemGroup.js';
+import UnfulfilledOrder from '../models/UnfulfilledOrder.js';
 import { computePacksOnHand, computePalletsOnHand, getPacksPerPallet } from '../utils/calc.js';
 
 export const inventoryReport = async (req, res) => {
@@ -158,6 +159,26 @@ export const palletSalesReport = async (req, res) => {
         committedAt: { $gte: fromDt, $lte: toDt },
         palletsDelta: { $lt: 0 },
         reason: { $in: salesReasons },
+      },
+    },
+    // Join to UnfulfilledOrder by order number (poNumber) to inspect current status.
+    // Include txns with no matching unfulfilled order (e.g., fulfilled imports),
+    // or with an order whose current status is shipped/delivered/completed.
+    {
+      $lookup: {
+        from: UnfulfilledOrder.collection.name,
+        localField: 'poNumber',
+        foreignField: 'orderNumber',
+        as: 'orderDoc',
+      },
+    },
+    { $addFields: { orderDoc: { $first: '$orderDoc' } } },
+    {
+      $match: {
+        $or: [
+          { orderDoc: { $eq: null } },
+          { 'orderDoc.status': { $in: ['shipped', 'delivered', 'completed'] } },
+        ],
       },
     },
     {

@@ -31,16 +31,23 @@ export const updateEarlyBuy = async (req, res) => {
     }
   }
   const createdAt = String(b.createdAt).slice(0,10);
+  const containerArrival = String(b.containerArrival || '').slice(0,10);
   const estFulfillment = String(b.estFulfillment || '').slice(0,10);
   const estDelivered = String(b.estDelivered || '').slice(0,10);
   const today = new Date().toISOString().slice(0,10);
   if (createdAt > today) return res.status(400).json({ message: 'Created Order Date cannot be in the future' });
   if (!estFulfillment) return res.status(400).json({ message: 'Estimated ShipDate for Customer is required' });
-  if (estFulfillment && estFulfillment < createdAt) return res.status(400).json({ message: 'Estimated ShipDate must be \u2265 Created Order Date' });
+  if (estFulfillment && estFulfillment < createdAt) return res.status(400).json({ message: 'Estimated ShipDate must be ≥ Created Order Date' });
+  if (String(b.status || '').trim().toLowerCase() === 'processing' && !containerArrival) {
+    return res.status(400).json({ message: 'Container Arrival is required when status is PROCESSING' });
+  }
+  if (containerArrival && estFulfillment && containerArrival > estFulfillment) {
+    return res.status(400).json({ message: 'Container Arrival must be ≤ Estimated ShipDate for Customer' });
+  }
   if (String(b.status || '').trim().toLowerCase() === 'shipped' && !estDelivered) {
     return res.status(400).json({ message: 'Estimated Arrival Date is required when status is SHIPPED' });
   }
-  if (estDelivered && estDelivered < estFulfillment) return res.status(400).json({ message: 'Estimated Arrival Date must be \u2265 Estimated ShipDate' });
+  if (estDelivered && estDelivered < estFulfillment) return res.status(400).json({ message: 'Estimated Arrival Date must be ≥ Estimated ShipDate' });
 
   const lines = Array.isArray(b.lines) ? b.lines : [];
   if (!lines.some((l)=> Number(l?.qty||0) > 0)) {
@@ -52,6 +59,7 @@ export const updateEarlyBuy = async (req, res) => {
     ...(updatedBy ? { updatedBy } : {}),
     warehouseId: 'MPG',
     createdAtYmd: createdAt,
+    containerArrival,
     estFulfillment,
     estDelivered,
     customerEmail: String(b.customerEmail||'').trim(),
@@ -66,7 +74,13 @@ export const updateEarlyBuy = async (req, res) => {
       groupName: String(l?.groupName||'').trim(),
       lineItem: String(l?.lineItem||'').trim(),
       palletName: String(l?.palletName||'').trim(),
-      qty: Math.max(0, Math.floor(Number(l?.qty||0)))
+      qty: Math.max(0, Math.floor(Number(l?.qty||0))),
+      discountPercent: (() => {
+        const raw = (l && (l.discountPercent ?? l.discount)) ?? 0;
+        const v = Number(raw);
+        if (!Number.isFinite(v)) return 0;
+        return Math.max(0, Math.min(100, Math.floor(v)));
+      })(),
     })),
   };
 
@@ -85,12 +99,19 @@ export const createEarlyBuy = async (req, res) => {
     }
   }
   const createdAt = String(b.createdAt).slice(0,10);
+  const containerArrival = String(b.containerArrival || '').slice(0,10);
   const estFulfillment = String(b.estFulfillment || '').slice(0,10);
   const estDelivered = String(b.estDelivered || '').slice(0,10);
   const today = new Date().toISOString().slice(0,10);
   if (createdAt > today) return res.status(400).json({ message: 'Created Order Date cannot be in the future' });
-  if (estFulfillment && estFulfillment < createdAt) return res.status(400).json({ message: 'Estimated ShipDate must be \\u2265 Created Order Date' });
-  if (estDelivered && estDelivered < estFulfillment) return res.status(400).json({ message: 'Estimated Arrival Date must be \\u2265 Estimated ShipDate' });
+  if (estFulfillment && estFulfillment < createdAt) return res.status(400).json({ message: 'Estimated ShipDate must be ≥ Created Order Date' });
+  if (String(b.status || '').trim().toLowerCase() === 'processing' && !containerArrival) {
+    return res.status(400).json({ message: 'Container Arrival is required when status is PROCESSING' });
+  }
+  if (containerArrival && estFulfillment && containerArrival > estFulfillment) {
+    return res.status(400).json({ message: 'Container Arrival must be ≤ Estimated ShipDate for Customer' });
+  }
+  if (estDelivered && estDelivered < estFulfillment) return res.status(400).json({ message: 'Estimated Arrival Date must be ≥ Estimated ShipDate' });
 
   const lines = Array.isArray(b.lines) ? b.lines : [];
   if (!lines.some((l)=> Number(l?.qty||0) > 0)) {
@@ -104,6 +125,7 @@ export const createEarlyBuy = async (req, res) => {
     ...(updatedBy ? { updatedBy } : {}),
     warehouseId: 'MPG',
     createdAtYmd: createdAt,
+    containerArrival,
     estFulfillment,
     estDelivered,
     customerEmail: String(b.customerEmail||'').trim(),
@@ -118,7 +140,13 @@ export const createEarlyBuy = async (req, res) => {
       groupName: String(l?.groupName||'').trim(),
       lineItem: String(l?.lineItem||'').trim(),
       palletName: String(l?.palletName||'').trim(),
-      qty: Math.max(0, Math.floor(Number(l?.qty||0)))
+      qty: Math.max(0, Math.floor(Number(l?.qty||0))),
+      discountPercent: (() => {
+        const raw = (l && (l.discountPercent ?? l.discount)) ?? 0;
+        const v = Number(raw);
+        if (!Number.isFinite(v)) return 0;
+        return Math.max(0, Math.min(100, Math.floor(v)));
+      })(),
     })),
   });
   return res.status(201).json(doc);

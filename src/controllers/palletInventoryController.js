@@ -225,15 +225,18 @@ export const groupDetails = async (req, res) => {
   const groupName = normalizeStr(req.params.groupName || '');
   if (!groupName) return res.status(400).json({ message: 'groupName required' });
   const perWarehouse = await PalletGroupStock.find({ groupName }).lean();
-  const items = await Item.find({ itemGroup: groupName }).select('itemCode description color itemGroup packSize').lean();
+  // Include price so downstream UIs (e.g. Orders page pallet items dialog) can show Item Price
+  const items = await Item.find({ itemGroup: groupName }).select('itemCode description color itemGroup packSize price upc').lean();
   const whMap = new Map(perWarehouse.map(s => [String(s.warehouseId), s.pallets]));
   const itemsWithDerived = items.map((it) => {
     const packSize = Number(it.packSize) || 0;
+    const price = Number(it.price) || 0;
+    const upc = String(it.upc || '').trim();
     const derived = {};
     for (const [wid, pallets] of whMap.entries()) derived[wid] = { pallets, qty: pallets * packSize };
     const totalPallets = Array.from(whMap.values()).reduce((a,b)=>a+b,0);
     const totalQty = totalPallets * packSize;
-    return { ...it, packSize, totalPallets, perWarehouse: derived, totalQty };
+    return { ...it, upc, packSize, price, totalPallets, perWarehouse: derived, totalQty };
   });
   const txns = await PalletGroupTxn.find({ groupName }).sort({ createdAt: -1 }).limit(20).lean();
   res.json({ groupName, perWarehouse, items: itemsWithDerived, recentTransactions: txns });

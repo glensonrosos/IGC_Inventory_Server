@@ -4,6 +4,7 @@ import { autoAllocateOrder } from '../services/allocation.js';
 import * as XLSX from 'xlsx';
 import Warehouse from '../models/Warehouse.js';
 import ItemGroup from '../models/ItemGroup.js';
+import Item from '../models/Item.js';
 import PalletGroupStock from '../models/PalletGroupStock.js';
 import PalletGroupTxn from '../models/PalletGroupTxn.js';
 import PalletGroupReservation from '../models/PalletGroupReservation.js';
@@ -87,7 +88,7 @@ const getReservationMaps = async ({ warehouseId }) => {
   for (const r of rows || []) {
     const groupName = String(r?._id?.groupName || '').trim();
     const source = String(r?._id?.source || '').trim();
-    const wid = String(r?._id?.sourceWarehouseIdStr || '').trim();
+    let wid = String(r?._id?.sourceWarehouseIdStr || '').trim();
     const qty = Number(r?.qty || 0);
     if (!groupName || !Number.isFinite(qty) || qty <= 0) continue;
 
@@ -99,6 +100,9 @@ const getReservationMaps = async ({ warehouseId }) => {
       onProcess.set(groupName, (onProcess.get(groupName) || 0) + qty);
       continue;
     }
+
+    // Normalize: treat missing sourceWarehouseId for primary as the same warehouse where reservations are recorded
+    if (source === 'primary' && !wid) wid = String(warehouseId || '').trim();
 
     if ((source === 'primary' || source === 'second') && wid) {
       if (!physicalByWarehouse.has(wid)) physicalByWarehouse.set(wid, new Map());
@@ -195,6 +199,20 @@ const rebalanceProcessingOrderAllocations = async ({ order, resolveToGroupName }
     else if (source === 'on_process') orderOnProcess.set(groupName, (orderOnProcess.get(groupName) || 0) + qty);
     else if (source === 'second' && wh2 && srcWid === wh2) orderSecond.set(groupName, (orderSecond.get(groupName) || 0) + qty);
   }
+  // Fallback: if no reservation docs exist for this order (legacy), seed from persisted allocations
+  if ((!resDocs || resDocs.length === 0) && Array.isArray(order?.allocations)) {
+    for (const a of order.allocations) {
+      const g = String(a?.groupName || '').trim();
+      const q = Math.floor(Number(a?.qty || 0));
+      const src = String(a?.source || '').trim();
+      const wid = String(a?.warehouseId || '').trim();
+      if (!g || !Number.isFinite(q) || q <= 0) continue;
+      if (src === 'primary') orderPrimary.set(g, (orderPrimary.get(g) || 0) + q);
+      else if (src === 'on_water') orderOnWater.set(g, (orderOnWater.get(g) || 0) + q);
+      else if (src === 'on_process') orderOnProcess.set(g, (orderOnProcess.get(g) || 0) + q);
+      else if (src === 'second' && wh2 && wid === wh2) orderSecond.set(g, (orderSecond.get(g) || 0) + q);
+    }
+  }
 
   const nextAllocs = Array.isArray(order.allocations) ? order.allocations.map((a) => ({ ...a })) : [];
   const addAlloc = (groupName, qty, source, warehouseId) => {
@@ -278,7 +296,7 @@ const rebalanceProcessingOrderAllocations = async ({ order, resolveToGroupName }
       const availP = Math.max(0, totalP - reservedP);
       const takeP = Math.min(remaining, availP);
       if (takeP > 0) {
-        await incReservation({ groupName: g, source: 'primary', qty: takeP, sourceWarehouseId: primaryWarehouseId });
+        await incReservation({ groupName: g, source: 'primary', qty: takeP });
         addAlloc(g, takeP, 'primary', primaryWarehouseId);
         orderPrimary.set(g, (orderPrimary.get(g) || 0) + takeP);
         remaining -= takeP;
@@ -353,12 +371,33 @@ const rebalanceProcessingOrderAllocations = async ({ order, resolveToGroupName }
       const take = Math.min(ow, avail);
       if (take > 0) {
         await decReservation({ groupName: g, source: 'on_water', qty: take });
-        await incReservation({ groupName: g, source: 'primary', qty: take, sourceWarehouseId: primaryWarehouseId });
+        await incReservation({ groupName: g, source: 'primary', qty: take });
         decAlloc(g, take, 'on_water');
         addAlloc(g, take, 'primary', primaryWarehouseId);
 
         orderOnWater.set(g, ow - take);
         reservedOnWaterTotals.set(g, Math.max(0, Number(reservedOnWaterTotals.get(g) || 0) - take));
+        reservedPhysicalPrimary.set(g, reserved + take);
+        moved = true;
+      }
+    }
+
+    // 1.5) second -> primary (direct) when primary capacity opens up
+    const sec2 = Math.max(0, Number(orderSecond.get(g) || 0));
+    if (wh2 && sec2 > 0) {
+      const stockDoc = await PalletGroupStock.findOne({ warehouseId: primaryWarehouseId, groupName: g }).select('pallets').lean();
+      const total = Math.max(0, Number(stockDoc?.pallets || 0));
+      const reserved = Math.max(0, Number(reservedPhysicalPrimary.get(g) || 0));
+      const avail = Math.max(0, total - reserved);
+      const take = Math.min(sec2, avail);
+      if (take > 0) {
+        await decReservation({ groupName: g, source: 'second', qty: take, sourceWarehouseId: wh2 });
+        await incReservation({ groupName: g, source: 'primary', qty: take });
+        decAlloc(g, take, 'second', wh2);
+        addAlloc(g, take, 'primary', primaryWarehouseId);
+
+        orderSecond.set(g, sec2 - take);
+        reservedPhysicalSecond.set(g, Math.max(0, Number(reservedPhysicalSecond.get(g) || 0) - take));
         reservedPhysicalPrimary.set(g, reserved + take);
         moved = true;
       }
@@ -1240,14 +1279,21 @@ export const createUnfulfilledOrder = async (req, res) => {
     const qty = Number(ln?.qty);
     if (!search) return res.status(400).json({ message: 'pallet id required' });
     if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ message: 'qty must be > 0' });
+    const rawDiscount = Number(ln?.discountPercent ?? ln?.discount ?? 0);
+    const hasDiscount = Number.isFinite(rawDiscount);
+    const safeDiscount = hasDiscount ? Math.max(0, Math.min(100, Math.floor(rawDiscount))) : undefined;
     const groupName = resolveGroupName({ input: search, byGroupLower, byLineItemLower });
     if (!groupName) return res.status(400).json({ message: `Unknown Pallet Description / Pallet ID: ${search}` });
     // Find canonical lineItem for saving (best effort)
     const g = await ItemGroup.findOne({ name: groupName }).select('lineItem name').lean();
+    const rawUnit = Number(ln?.unitPrice);
+    const hasUnit = Number.isFinite(rawUnit) && rawUnit >= 0;
     parsedLines.push({
       groupName,
       lineItem: (g?.lineItem || search).trim(),
       qty: Math.floor(qty),
+      ...(hasDiscount ? { discountPercent: safeDiscount } : {}),
+      ...(hasUnit ? { unitPrice: Number(rawUnit.toFixed ? rawUnit : rawUnit) } : {}),
     });
   }
 
@@ -1290,58 +1336,114 @@ export const createUnfulfilledOrder = async (req, res) => {
 
   const shortages = [];
 
+  // Helper to compute current unit price from registry when not provided
+  const unitPriceCache = new Map(); // groupName => number
+  const getUnitPriceFor = async (groupName) => {
+    const g = String(groupName || '').trim();
+    if (!g) return 0;
+    if (unitPriceCache.has(g)) return unitPriceCache.get(g);
+    const agg = await Item.aggregate([
+      { $match: { enabled: true, itemGroup: g } },
+      { $group: { _id: null, total: { $sum: { $ifNull: ['$price', 0] } } } },
+    ]);
+    const total = Math.max(0, Math.floor(Number((agg && agg[0]?.total) || 0)));
+    unitPriceCache.set(g, total);
+    return total;
+  };
+
+  // Compute a snapshot of base availability per line at save time (before applying this order's new reservations)
+  const linesWithSnapshot = [];
+  for (const ln of parsedLines) {
+    const groupName = String(ln.groupName || '').trim();
+    if (!groupName) continue;
+    const primaryStockDoc = await PalletGroupStock.findOne({ warehouseId, groupName }).lean();
+    const primaryReserved = Math.max(0, Number(reservation.physicalByWarehouse?.get(String(warehouseId))?.get(groupName) || 0));
+    const primaryAvail = Math.max(0, Number(primaryStockDoc?.pallets || 0) - primaryReserved);
+
+    const onWaterTotal = Math.max(0, Number(onWaterMap.get(groupName) || 0));
+    const onWaterReserved = Math.max(0, Number(reservation.onWater.get(groupName) || 0));
+    const onWaterAvail = Math.max(0, onWaterTotal - onWaterReserved);
+
+    const onProcessTotal = Math.max(0, Number(onProcessMap.get(groupName) || 0));
+    const onProcessReserved = Math.max(0, Number(reservation.onProcess.get(groupName) || 0));
+    const onProcessAvail = Math.max(0, onProcessTotal - onProcessReserved);
+
+    let secondAvail = 0;
+    if (secondWarehouse?._id) {
+      const wh2 = secondWarehouse._id;
+      const secondStockDoc = await PalletGroupStock.findOne({ warehouseId: wh2, groupName }).lean();
+      const secondReserved = Math.max(0, Number(reservation.physicalByWarehouse?.get(String(wh2))?.get(groupName) || 0));
+      secondAvail = Math.max(0, Number(secondStockDoc?.pallets || 0) - secondReserved);
+    }
+
+    const total = Math.max(0, Math.floor(primaryAvail + onWaterAvail + secondAvail + onProcessAvail));
+    const unit = Number(ln?.unitPrice);
+    const resolvedUnit = Number.isFinite(unit) && unit >= 0 ? unit : await getUnitPriceFor(groupName);
+    linesWithSnapshot.push({ ...ln, unitPrice: resolvedUnit, baseTiers: { primary: primaryAvail, onWater: onWaterAvail, second: secondAvail, onProcess: onProcessAvail, total } });
+  }
+
+  // Seed intra-order availability per group from the precomputed snapshot so duplicates do not over-consume any tier
+  const groupAvail = new Map(); // groupName => { primary, onWater, second, onProcess }
+  for (const l of linesWithSnapshot) {
+    const g = String(l?.groupName || '').trim();
+    if (!g) continue;
+    const bt = (l?.baseTiers || {});
+    groupAvail.set(g, {
+      primary: Math.max(0, Math.floor(Number(bt.primary || 0))),
+      onWater: Math.max(0, Math.floor(Number(bt.onWater || 0))),
+      second: Math.max(0, Math.floor(Number(bt.second || 0))),
+      onProcess: Math.max(0, Math.floor(Number(bt.onProcess || 0))),
+    });
+  }
+
   for (const ln of parsedLines) {
     const groupName = String(ln.groupName || '').trim();
     const need = Math.floor(Number(ln.qty || 0));
     if (!groupName || !Number.isFinite(need) || need <= 0) continue;
 
-    // Primary (reserve only; do NOT deduct yet)
-    const primaryStockDoc = await PalletGroupStock.findOne({ warehouseId, groupName }).lean();
-    const primaryReserved = Math.max(0, Number(reservation.physicalByWarehouse?.get(String(warehouseId))?.get(groupName) || 0));
-    const primaryAvail = Math.max(0, Number(primaryStockDoc?.pallets || 0) - primaryReserved);
+    const tier = groupAvail.get(groupName) || { primary: 0, onWater: 0, second: 0, onProcess: 0 };
     let remaining = need;
-    const takePrimary = Math.min(primaryAvail, remaining);
-    if (takePrimary > 0) {
-      deductPrimary.set(groupName, (deductPrimary.get(groupName) || 0) + takePrimary);
-      allocations.push({ groupName, qty: takePrimary, source: 'primary' });
-      remaining -= takePrimary;
+
+    // Primary first
+    if (remaining > 0 && tier.primary > 0) {
+      const take = Math.min(tier.primary, remaining);
+      tier.primary -= take;
+      deductPrimary.set(groupName, (deductPrimary.get(groupName) || 0) + take);
+      allocations.push({ groupName, qty: take, source: 'primary' });
+      remaining -= take;
     }
 
-    // On-Water (subtract existing reservations)
-    const onWaterTotal = Math.max(0, Number(onWaterMap.get(groupName) || 0));
-    const onWaterReserved = Math.max(0, Number(reservation.onWater.get(groupName) || 0));
-    const onWaterAvail = Math.max(0, onWaterTotal - onWaterReserved);
-    const takeOnWater = Math.min(onWaterAvail, remaining);
-    if (takeOnWater > 0) {
-      reserveOnWater.set(groupName, (reserveOnWater.get(groupName) || 0) + takeOnWater);
-      allocations.push({ groupName, qty: takeOnWater, source: 'on_water' });
-      remaining -= takeOnWater;
+    // On-Water next
+    if (remaining > 0 && tier.onWater > 0) {
+      const take = Math.min(tier.onWater, remaining);
+      tier.onWater -= take;
+      reserveOnWater.set(groupName, (reserveOnWater.get(groupName) || 0) + take);
+      allocations.push({ groupName, qty: take, source: 'on_water' });
+      remaining -= take;
     }
 
-    // 2nd Warehouse (reserve only; do NOT deduct yet)
-    if (remaining > 0 && secondWarehouse?._id) {
-      const wh2 = secondWarehouse._id;
-      const secondStockDoc = await PalletGroupStock.findOne({ warehouseId: wh2, groupName }).lean();
-      const secondReserved = Math.max(0, Number(reservation.physicalByWarehouse?.get(String(wh2))?.get(groupName) || 0));
-      const secondAvail = Math.max(0, Number(secondStockDoc?.pallets || 0) - secondReserved);
-      const takeSecond = Math.min(secondAvail, remaining);
-      if (takeSecond > 0) {
-        deductSecond.set(groupName, (deductSecond.get(groupName) || 0) + takeSecond);
-        allocations.push({ groupName, qty: takeSecond, source: 'second', warehouseId: wh2 });
-        remaining -= takeSecond;
+    // Second warehouse
+    if (remaining > 0 && tier.second > 0) {
+      const take = Math.min(tier.second, remaining);
+      tier.second -= take;
+      const wh2 = String(secondWarehouse?._id || '').trim();
+      if (wh2) {
+        deductSecond.set(groupName, (deductSecond.get(groupName) || 0) + take);
+        allocations.push({ groupName, qty: take, source: 'second', warehouseId: wh2 });
+        remaining -= take;
       }
     }
 
-    // On-Process (subtract existing reservations)
-    const onProcessTotal = Math.max(0, Number(onProcessMap.get(groupName) || 0));
-    const onProcessReserved = Math.max(0, Number(reservation.onProcess.get(groupName) || 0));
-    const onProcessAvail = Math.max(0, onProcessTotal - onProcessReserved);
-    const takeOnProcess = Math.min(onProcessAvail, remaining);
-    if (takeOnProcess > 0) {
-      reserveOnProcess.set(groupName, (reserveOnProcess.get(groupName) || 0) + takeOnProcess);
-      allocations.push({ groupName, qty: takeOnProcess, source: 'on_process' });
-      remaining -= takeOnProcess;
+    // On-Process last
+    if (remaining > 0 && tier.onProcess > 0) {
+      const take = Math.min(tier.onProcess, remaining);
+      tier.onProcess -= take;
+      reserveOnProcess.set(groupName, (reserveOnProcess.get(groupName) || 0) + take);
+      allocations.push({ groupName, qty: take, source: 'on_process' });
+      remaining -= take;
     }
+
+    groupAvail.set(groupName, tier);
 
     if (remaining > 0) {
       shortages.push({
@@ -1356,19 +1458,23 @@ export const createUnfulfilledOrder = async (req, res) => {
   // Allow saving even when shortages exist; proceed with partial reservations
 
   // Create reservations (all tiers). Physical stock is only deducted when order becomes SHIPPED.
+  // Build reservation docs directly from computed allocations to prevent any drift
+  // between planned tier allocation and saved reservations.
   const reserveDocs = [];
-  for (const [groupName, qty] of deductPrimary.entries()) {
-    reserveDocs.push({ orderNumber, warehouseId, sourceWarehouseId: warehouseId, groupName, source: 'primary', qty, committedBy });
-  }
-  for (const [groupName, qty] of reserveOnWater.entries()) {
-    reserveDocs.push({ orderNumber, warehouseId, groupName, source: 'on_water', qty, committedBy });
-  }
-  for (const [groupName, qty] of reserveOnProcess.entries()) {
-    reserveDocs.push({ orderNumber, warehouseId, groupName, source: 'on_process', qty, committedBy });
-  }
-  if (secondWarehouse?._id) {
-    for (const [groupName, qty] of deductSecond.entries()) {
-      reserveDocs.push({ orderNumber, warehouseId, sourceWarehouseId: secondWarehouse._id, groupName, source: 'second', qty, committedBy });
+  for (const a of allocations) {
+    const groupName = String(a?.groupName || '').trim();
+    const qty = Math.floor(Number(a?.qty || 0));
+    const src = String(a?.source || '').trim();
+    if (!groupName || !Number.isFinite(qty) || qty <= 0) continue;
+    if (src === 'primary') {
+      reserveDocs.push({ orderNumber, warehouseId, sourceWarehouseId: warehouseId, groupName, source: 'primary', qty, committedBy });
+    } else if (src === 'on_water') {
+      reserveDocs.push({ orderNumber, warehouseId, groupName, source: 'on_water', qty, committedBy });
+    } else if (src === 'on_process') {
+      reserveDocs.push({ orderNumber, warehouseId, groupName, source: 'on_process', qty, committedBy });
+    } else if (src === 'second') {
+      const srcWid = String(a?.warehouseId || secondWarehouse?._id || '').trim();
+      if (srcWid) reserveDocs.push({ orderNumber, warehouseId, sourceWarehouseId: srcWid, groupName, source: 'second', qty, committedBy });
     }
   }
   if (reserveDocs.length) {
@@ -1399,7 +1505,7 @@ export const createUnfulfilledOrder = async (req, res) => {
     estDeliveredDate: nextStatus === 'shipped' && normalizeStr(estDeliveredDate) ? new Date(normalizeStr(estDeliveredDate)) : undefined,
     shippingAddress: normalizeStr(shippingAddress),
     notes: normalizeStr(notes),
-    lines: parsedLines,
+    lines: linesWithSnapshot.length ? linesWithSnapshot : parsedLines,
     allocations,
     status: nextStatus,
     committedBy,
@@ -2216,12 +2322,9 @@ export const getUnfulfilledOrderById = async (req, res) => {
   const raw = await UnfulfilledOrder.findById(id).select('orderNumber warehouseId status allocations lastUpdatedBy lines').lean();
   if (!raw) return res.status(404).json({ message: 'Order not found' });
 
-  try {
-    const resolveToGroupName = (v) => String(v || '').trim();
-    await rebalanceProcessingOrderAllocations({ order: { ...raw, _id: id }, resolveToGroupName });
-  } catch {
-    // best-effort; do not block UI
-  }
+  // Do not auto-rebalance here; it can cause tier drift between saved snapshot and the
+  // "Reserved Stock for this Order" view immediately after create/update. Rebalancing
+  // is handled explicitly by status transitions or maintenance endpoints.
 
   const doc = await UnfulfilledOrder.findById(id)
     .populate('warehouseId', 'name')
@@ -2232,20 +2335,45 @@ export const getUnfulfilledOrderById = async (req, res) => {
 
   let reservedBreakdown = [];
   try {
+    // Build from live PalletGroupReservation first
+    let builtFromReservations = false;
     const orderNumber = String(doc?.orderNumber || '').trim();
-    const warehouseId = String(doc?.warehouseId?._id || doc?.warehouseId || '').trim();
-    if (orderNumber && warehouseId) {
+    const widStr = String(doc?.warehouseId?._id || doc?.warehouseId || '').trim();
+    if (orderNumber && widStr) {
       const rows = await PalletGroupReservation.aggregate([
         { $addFields: { orderNumberStr: { $toString: '$orderNumber' }, warehouseIdStr: { $toString: '$warehouseId' } } },
-        { $match: { orderNumberStr: orderNumber, warehouseIdStr: warehouseId } },
+        { $match: { orderNumberStr: orderNumber, warehouseIdStr: widStr } },
         { $group: { _id: { groupName: '$groupName', source: '$source' }, qty: { $sum: '$qty' } } },
       ]);
+      if (rows && rows.length) {
+        const byGroup = new Map();
+        for (const r of rows) {
+          const groupName = String(r?._id?.groupName || '').trim();
+          const source = String(r?._id?.source || '').trim().toLowerCase();
+          const qty = Math.floor(Number(r?.qty || 0));
+          if (!groupName || !Number.isFinite(qty) || qty <= 0) continue;
+          if (!byGroup.has(groupName)) byGroup.set(groupName, { groupName, primary: 0, onWater: 0, second: 0, onProcess: 0 });
+          const rec = byGroup.get(groupName);
+          if (source === 'primary') rec.primary += qty;
+          else if (source === 'on_water') rec.onWater += qty;
+          else if (source === 'second') rec.second += qty;
+          else if (source === 'on_process') rec.onProcess += qty;
+        }
+        reservedBreakdown = Array.from(byGroup.values())
+          .map((r) => ({ id: r.groupName, ...r }))
+          .sort((a, b) => String(a.groupName).localeCompare(String(b.groupName)));
+        builtFromReservations = true;
+      }
+    }
 
+    // Fallback to persisted allocations if no reservations present
+    if (!builtFromReservations) {
+      const allocs = Array.isArray(doc?.allocations) ? doc.allocations : [];
       const byGroup = new Map();
-      for (const r of rows || []) {
-        const groupName = String(r?._id?.groupName || '').trim();
-        const source = String(r?._id?.source || '').trim().toLowerCase();
-        const qty = Math.floor(Number(r?.qty || 0));
+      for (const a of allocs) {
+        const groupName = String(a?.groupName || '').trim();
+        const source = String(a?.source || '').trim().toLowerCase();
+        const qty = Math.floor(Number(a?.qty || 0));
         if (!groupName || !Number.isFinite(qty) || qty <= 0) continue;
         if (!byGroup.has(groupName)) byGroup.set(groupName, { groupName, primary: 0, onWater: 0, second: 0, onProcess: 0 });
         const rec = byGroup.get(groupName);
@@ -2254,7 +2382,6 @@ export const getUnfulfilledOrderById = async (req, res) => {
         else if (source === 'second') rec.second += qty;
         else if (source === 'on_process') rec.onProcess += qty;
       }
-
       reservedBreakdown = Array.from(byGroup.values())
         .map((r) => ({ id: r.groupName, ...r }))
         .sort((a, b) => String(a.groupName).localeCompare(String(b.groupName)));
@@ -2263,7 +2390,99 @@ export const getUnfulfilledOrderById = async (req, res) => {
     reservedBreakdown = [];
   }
 
-  res.json({ ...doc, reservedBreakdown });
+  // Derive status for UI if current status is processing/ready_to_ship
+  // Logic mirrors list endpoint: if any deficit exists, remain PROCESSING. If fully primary (no second/on-water/on-process), set READY TO SHIP.
+  try {
+    const cur = (doc && typeof doc === 'object') ? doc : {};
+    const statusNorm = normalizeOrderStatus(cur.status || 'processing') || 'processing';
+    let derivedStatus = statusNorm;
+    if (statusNorm === 'processing' || statusNorm === 'ready_to_ship') {
+      // Build required qty per group from lines
+      const needByGroup = new Map();
+      const lines = Array.isArray(cur?.lines) ? cur.lines : [];
+      for (const ln of lines) {
+        const g = String(ln?.groupName || '').trim();
+        const q = Math.floor(Number(ln?.qty || 0));
+        if (!g || !Number.isFinite(q) || q <= 0) continue;
+        const key = g.toLowerCase();
+        needByGroup.set(key, (needByGroup.get(key) || 0) + q);
+      }
+
+      const totalsAll = new Map();
+      const totalsPrimary = new Map();
+      const totalsSecond = new Map();
+      const totalsOnWater = new Map();
+      const totalsOnProcess = new Map();
+
+      // Prefer aggregating live reservations for this order to avoid stale allocations
+      let hadAnyReservations = false;
+      const orderNumber = String(cur?.orderNumber || '').trim();
+      const warehouseId = String(cur?.warehouseId?._id || cur?.warehouseId || '').trim();
+      if (orderNumber && warehouseId) {
+        const rows = await PalletGroupReservation.aggregate([
+          { $addFields: { orderNumberStr: { $toString: '$orderNumber' }, warehouseIdStr: { $toString: '$warehouseId' } } },
+          { $match: { orderNumberStr: orderNumber, warehouseIdStr: warehouseId } },
+          { $group: { _id: { groupName: '$groupName', source: '$source' }, qty: { $sum: '$qty' } } },
+        ]);
+        for (const r of rows || []) {
+          const g = String(r?._id?.groupName || '').trim().toLowerCase();
+          const src = String(r?._id?.source || '').trim().toLowerCase();
+          const q = Math.floor(Number(r?.qty || 0));
+          if (!g || !Number.isFinite(q) || q <= 0) continue;
+          hadAnyReservations = true;
+          totalsAll.set(g, (totalsAll.get(g) || 0) + q);
+          if (src === 'primary') totalsPrimary.set(g, (totalsPrimary.get(g) || 0) + q);
+          else if (src === 'second') totalsSecond.set(g, (totalsSecond.get(g) || 0) + q);
+          else if (src === 'on_water') totalsOnWater.set(g, (totalsOnWater.get(g) || 0) + q);
+          else if (src === 'on_process') totalsOnProcess.set(g, (totalsOnProcess.get(g) || 0) + q);
+        }
+      }
+
+      // If reservations are missing (e.g. legacy orders), fall back to persisted allocations
+      if (!hadAnyReservations) {
+        const allocs = Array.isArray(cur?.allocations) ? cur.allocations : [];
+        for (const a of allocs) {
+          const g = String(a?.groupName || '').trim().toLowerCase();
+          const src = String(a?.source || '').trim().toLowerCase();
+          const q = Math.floor(Number(a?.qty || 0));
+          if (!g || !Number.isFinite(q) || q <= 0) continue;
+          totalsAll.set(g, (totalsAll.get(g) || 0) + q);
+          if (src === 'primary') totalsPrimary.set(g, (totalsPrimary.get(g) || 0) + q);
+          else if (src === 'second') totalsSecond.set(g, (totalsSecond.get(g) || 0) + q);
+          else if (src === 'on_water') totalsOnWater.set(g, (totalsOnWater.get(g) || 0) + q);
+          else if (src === 'on_process') totalsOnProcess.set(g, (totalsOnProcess.get(g) || 0) + q);
+        }
+      }
+
+      // Detect any deficit vs ordered qty
+      let hasDeficit = false;
+      for (const [gk, need] of Array.from(needByGroup.entries())) {
+        const have = Math.max(0, Number(totalsAll.get(gk) || 0));
+        if (have < need) { hasDeficit = true; break; }
+      }
+
+      if (hasDeficit) {
+        derivedStatus = 'processing';
+      } else {
+        // Fully primary only if no non-primary sources and primary covers all needs
+        let anyNonPrimary = false;
+        for (const v of Array.from(totalsSecond.values())) if (Number(v || 0) > 0) { anyNonPrimary = true; break; }
+        if (!anyNonPrimary) for (const v of Array.from(totalsOnWater.values())) if (Number(v || 0) > 0) { anyNonPrimary = true; break; }
+        if (!anyNonPrimary) for (const v of Array.from(totalsOnProcess.values())) if (Number(v || 0) > 0) { anyNonPrimary = true; break; }
+        let primaryCovers = true;
+        for (const [gk, need] of Array.from(needByGroup.entries())) {
+          const havePrim = Math.max(0, Number(totalsPrimary.get(gk) || 0));
+          if (havePrim < need) { primaryCovers = false; break; }
+        }
+        const fullyPrimary = !anyNonPrimary && primaryCovers;
+        derivedStatus = fullyPrimary ? 'ready_to_ship' : 'processing';
+      }
+    }
+
+    return res.json({ ...doc, status: derivedStatus, reservedBreakdown });
+  } catch {
+    return res.json({ ...doc, reservedBreakdown });
+  }
 };
 
 export const rebalanceProcessingOrdersInternal = async ({ warehouseId, groupNames }) => {
@@ -2408,6 +2627,13 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
     doc.status = 'canceled';
     doc.lastUpdatedBy = committedBy;
     await doc.save();
+    // Immediately trigger a focused rebalance so other PROCESSING/READY TO SHIP orders can claim freed stock
+    try {
+      const wid = String(doc.warehouseId || '').trim();
+      await rebalanceProcessingOrdersInternal({ warehouseId: wid || undefined });
+    } catch (e) {
+      // best-effort; do not block cancel on rebalance failure
+    }
     return res.json(doc.toObject());
   }
 
@@ -2633,29 +2859,25 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
       const qty = Number(ln?.qty);
       if (!search) return res.status(400).json({ message: 'pallet id required' });
       if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ message: 'qty must be > 0' });
+      const rawDiscount = Number(ln?.discountPercent ?? ln?.discount ?? 0);
+      const hasDiscount = Number.isFinite(rawDiscount);
+      const safeDiscount = hasDiscount ? Math.max(0, Math.min(100, Math.floor(rawDiscount))) : undefined;
       const groupName = resolveGroupName({ input: search, byGroupLower, byLineItemLower });
       if (!groupName) return res.status(400).json({ message: `Unknown Pallet Description / Pallet ID: ${search}` });
       const g = await ItemGroup.findOne({ name: groupName }).select('lineItem name').lean();
+      const rawUnit = Number(ln?.unitPrice);
+      const hasUnit = Number.isFinite(rawUnit) && rawUnit >= 0;
       parsedLines.push({
         groupName,
         lineItem: (normalizeStr(ln?.lineItem) || g?.lineItem || search).trim(),
         qty: Math.floor(qty),
+        ...(hasDiscount ? { discountPercent: safeDiscount } : {}),
+        ...(hasUnit ? { unitPrice: Number(rawUnit.toFixed ? rawUnit : rawUnit) } : {}),
       });
     }
 
-    // De-duplicate by groupName (sum qty)
-    const merged = new Map();
-    for (const ln of parsedLines) {
-      merged.set(ln.groupName, (merged.get(ln.groupName) || 0) + Number(ln.qty || 0));
-    }
-    const nextLines = Array.from(merged.entries()).map(([groupName, qty]) => {
-      const sample = parsedLines.find((p) => p.groupName === groupName);
-      return {
-        groupName,
-        lineItem: (sample?.lineItem || groupName).trim(),
-        qty: Math.floor(Number(qty || 0)),
-      };
-    });
+    // Preserve each line separately (no merging by groupName) so multiple rows per pallet are stored.
+    const nextLines = parsedLines;
 
     // processing: reserve-only. Recompute reservations + allocations based on new lines.
     const orderNumber = String(existing.orderNumber || '').trim();
@@ -2682,62 +2904,114 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
     const onWaterMap = await buildOnWaterMapForWarehouse({ warehouseId: existing.warehouseId, resolveToGroupName });
     const onProcessMap = await buildOnProcessMap({ resolveToGroupName });
 
-    const allocations = [];
-    const reservePrimary = new Map();
-    const reserveSecond = new Map();
-    const reserveOnWater = new Map();
-    const reserveOnProcess = new Map();
+    // Helper to compute current unit price from registry when not provided
+    const unitPriceCache = new Map(); // groupName => number
+    const getUnitPriceFor = async (groupName) => {
+      const g = String(groupName || '').trim();
+      if (!g) return 0;
+      if (unitPriceCache.has(g)) return unitPriceCache.get(g);
+      const agg = await Item.aggregate([
+        { $match: { enabled: true, itemGroup: g } },
+        { $group: { _id: null, total: { $sum: { $ifNull: ['$price', 0] } } } },
+      ]);
+      const total = Math.max(0, Math.floor(Number((agg && agg[0]?.total) || 0)));
+      unitPriceCache.set(g, total);
+      return total;
+    };
 
+    // Compute a snapshot of base availability per line at save time (before applying this order's new reservations)
+    const linesWithSnapshot = [];
+    for (const ln of nextLines) {
+      const groupName = String(ln.groupName || '').trim();
+      if (!groupName) continue;
+      const primaryStockDoc = await PalletGroupStock.findOne({ warehouseId: existing.warehouseId, groupName }).lean();
+      const primaryReserved = Math.max(0, Number(reservation.physicalByWarehouse?.get(String(existing.warehouseId))?.get(groupName) || 0));
+      const primaryAvail = Math.max(0, Number(primaryStockDoc?.pallets || 0) - primaryReserved);
+
+      const onWaterTotal = Math.max(0, Number(onWaterMap.get(groupName) || 0));
+      const onWaterReserved = Math.max(0, Number(reservation.onWater.get(groupName) || 0));
+      const onWaterAvail = Math.max(0, onWaterTotal - onWaterReserved);
+
+      const onProcessTotal = Math.max(0, Number(onProcessMap.get(groupName) || 0));
+      const onProcessReserved = Math.max(0, Number(reservation.onProcess.get(groupName) || 0));
+      const onProcessAvail = Math.max(0, onProcessTotal - onProcessReserved);
+
+      let secondAvail = 0;
+      if (secondWarehouse?._id) {
+        const wh2 = secondWarehouse._id;
+        const secondStockDoc = await PalletGroupStock.findOne({ warehouseId: wh2, groupName }).lean();
+        const secondReserved = Math.max(0, Number(reservation.physicalByWarehouse?.get(String(wh2))?.get(groupName) || 0));
+        secondAvail = Math.max(0, Number(secondStockDoc?.pallets || 0) - secondReserved);
+      }
+
+      const total = Math.max(0, Math.floor(primaryAvail + onWaterAvail + secondAvail + onProcessAvail));
+      const unit = Number(ln?.unitPrice);
+      const resolvedUnit = Number.isFinite(unit) && unit >= 0 ? unit : await getUnitPriceFor(groupName);
+      linesWithSnapshot.push({ ...ln, unitPrice: resolvedUnit, baseTiers: { primary: primaryAvail, onWater: onWaterAvail, second: secondAvail, onProcess: onProcessAvail, total } });
+    }
+
+    // Build allocations using snapshot-seeded intra-order availability to avoid over-consuming any tier across duplicates
+    const allocations = [];
     const shortages = [];
+
+    // Seed intra-order availability per group from the precomputed snapshot
+    const groupAvail = new Map(); // groupName => { primary, onWater, second, onProcess }
+    for (const l of linesWithSnapshot) {
+      const g = String(l?.groupName || '').trim();
+      if (!g) continue;
+      const bt = (l?.baseTiers || {});
+      groupAvail.set(g, {
+        primary: Math.max(0, Math.floor(Number(bt.primary || 0))),
+        onWater: Math.max(0, Math.floor(Number(bt.onWater || 0))),
+        second: Math.max(0, Math.floor(Number(bt.second || 0))),
+        onProcess: Math.max(0, Math.floor(Number(bt.onProcess || 0))),
+      });
+    }
 
     for (const ln of nextLines) {
       const groupName = String(ln.groupName || '').trim();
       const need = Math.floor(Number(ln.qty || 0));
       if (!groupName || !Number.isFinite(need) || need <= 0) continue;
 
-      const primaryStockDoc = await PalletGroupStock.findOne({ warehouseId: existing.warehouseId, groupName }).lean();
-      const primaryReserved = Math.max(0, Number(reservation.physicalByWarehouse?.get(String(existing.warehouseId))?.get(groupName) || 0));
-      const primaryAvail = Math.max(0, Number(primaryStockDoc?.pallets || 0) - primaryReserved);
+      const tier = groupAvail.get(groupName) || { primary: 0, onWater: 0, second: 0, onProcess: 0 };
       let remaining = need;
-      const takePrimary = Math.min(primaryAvail, remaining);
-      if (takePrimary > 0) {
-        reservePrimary.set(groupName, (reservePrimary.get(groupName) || 0) + takePrimary);
-        allocations.push({ groupName, qty: takePrimary, source: 'primary' });
-        remaining -= takePrimary;
+
+      // Primary first
+      if (remaining > 0 && tier.primary > 0) {
+        const take = Math.min(tier.primary, remaining);
+        tier.primary -= take;
+        allocations.push({ groupName, qty: take, source: 'primary' });
+        remaining -= take;
       }
 
-      const onWaterTotal = Math.max(0, Number(onWaterMap.get(groupName) || 0));
-      const onWaterReserved = Math.max(0, Number(reservation.onWater.get(groupName) || 0));
-      const onWaterAvail = Math.max(0, onWaterTotal - onWaterReserved);
-      const takeOnWater = Math.min(onWaterAvail, remaining);
-      if (takeOnWater > 0) {
-        reserveOnWater.set(groupName, (reserveOnWater.get(groupName) || 0) + takeOnWater);
-        allocations.push({ groupName, qty: takeOnWater, source: 'on_water' });
-        remaining -= takeOnWater;
+      // On-Water next
+      if (remaining > 0 && tier.onWater > 0) {
+        const take = Math.min(tier.onWater, remaining);
+        tier.onWater -= take;
+        allocations.push({ groupName, qty: take, source: 'on_water' });
+        remaining -= take;
       }
 
-      const onProcessTotal = Math.max(0, Number(onProcessMap.get(groupName) || 0));
-      const onProcessReserved = Math.max(0, Number(reservation.onProcess.get(groupName) || 0));
-      const onProcessAvail = Math.max(0, onProcessTotal - onProcessReserved);
-      const takeOnProcess = Math.min(onProcessAvail, remaining);
-      if (takeOnProcess > 0) {
-        reserveOnProcess.set(groupName, (reserveOnProcess.get(groupName) || 0) + takeOnProcess);
-        allocations.push({ groupName, qty: takeOnProcess, source: 'on_process' });
-        remaining -= takeOnProcess;
-      }
-
-      if (remaining > 0 && secondWarehouse?._id) {
-        const wh2 = secondWarehouse._id;
-        const secondStockDoc = await PalletGroupStock.findOne({ warehouseId: wh2, groupName }).lean();
-        const secondReserved = Math.max(0, Number(reservation.physicalByWarehouse?.get(String(wh2))?.get(groupName) || 0));
-        const secondAvail = Math.max(0, Number(secondStockDoc?.pallets || 0) - secondReserved);
-        const takeSecond = Math.min(secondAvail, remaining);
-        if (takeSecond > 0) {
-          reserveSecond.set(groupName, (reserveSecond.get(groupName) || 0) + takeSecond);
-          allocations.push({ groupName, qty: takeSecond, source: 'second', warehouseId: wh2 });
-          remaining -= takeSecond;
+      // Second warehouse
+      if (remaining > 0 && tier.second > 0) {
+        const take = Math.min(tier.second, remaining);
+        tier.second -= take;
+        const wh2 = String(secondWarehouse?._id || '').trim();
+        if (wh2) {
+          allocations.push({ groupName, qty: take, source: 'second', warehouseId: wh2 });
+          remaining -= take;
         }
       }
+
+      // On-Process last
+      if (remaining > 0 && tier.onProcess > 0) {
+        const take = Math.min(tier.onProcess, remaining);
+        tier.onProcess -= take;
+        allocations.push({ groupName, qty: take, source: 'on_process' });
+        remaining -= take;
+      }
+
+      groupAvail.set(groupName, tier);
 
       if (remaining > 0) {
         shortages.push({
@@ -2749,25 +3023,28 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
       }
     }
 
+    // Build reservation docs directly from computed allocations for consistency
     const reserveDocs = [];
-    for (const [groupName, qty] of reservePrimary.entries()) {
-      reserveDocs.push({ orderNumber, warehouseId: existing.warehouseId, sourceWarehouseId: existing.warehouseId, groupName, source: 'primary', qty, committedBy });
-    }
-    for (const [groupName, qty] of reserveOnWater.entries()) {
-      reserveDocs.push({ orderNumber, warehouseId: existing.warehouseId, groupName, source: 'on_water', qty, committedBy });
-    }
-    for (const [groupName, qty] of reserveOnProcess.entries()) {
-      reserveDocs.push({ orderNumber, warehouseId: existing.warehouseId, groupName, source: 'on_process', qty, committedBy });
-    }
-    if (secondWarehouse?._id) {
-      for (const [groupName, qty] of reserveSecond.entries()) {
-        reserveDocs.push({ orderNumber, warehouseId: existing.warehouseId, sourceWarehouseId: secondWarehouse._id, groupName, source: 'second', qty, committedBy });
+    for (const a of allocations) {
+      const groupName = String(a?.groupName || '').trim();
+      const qty = Math.floor(Number(a?.qty || 0));
+      const src = String(a?.source || '').trim();
+      if (!groupName || !Number.isFinite(qty) || qty <= 0) continue;
+      if (src === 'primary') {
+        reserveDocs.push({ orderNumber, warehouseId: existing.warehouseId, sourceWarehouseId: existing.warehouseId, groupName, source: 'primary', qty, committedBy });
+      } else if (src === 'on_water') {
+        reserveDocs.push({ orderNumber, warehouseId: existing.warehouseId, groupName, source: 'on_water', qty, committedBy });
+      } else if (src === 'on_process') {
+        reserveDocs.push({ orderNumber, warehouseId: existing.warehouseId, groupName, source: 'on_process', qty, committedBy });
+      } else if (src === 'second') {
+        const srcWid = String(a?.warehouseId || secondWarehouse?._id || '').trim();
+        if (srcWid) reserveDocs.push({ orderNumber, warehouseId: existing.warehouseId, sourceWarehouseId: srcWid, groupName, source: 'second', qty, committedBy });
       }
     }
     if (reserveDocs.length) await PalletGroupReservation.insertMany(reserveDocs);
     set.allocations = allocations;
 
-    set.lines = nextLines;
+    set.lines = linesWithSnapshot;
 
     // If any shortages remain, this order cannot be READY TO SHIP
     if (shortages.length > 0) {
@@ -2775,7 +3052,7 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
       // Ensure shipdate only exists for READY TO SHIP
       set.estFulfillmentDate = null;
     } else {
-      const fullyPrimary = reserveSecond.size === 0 && reserveOnWater.size === 0 && reserveOnProcess.size === 0;
+      const fullyPrimary = (Array.isArray(allocations) ? allocations : []).every((a) => String(a?.source || '') === 'primary');
       set.status = fullyPrimary ? 'ready_to_ship' : 'processing';
       // Set shipdate when fully primary; otherwise clear it
       if (set.status === 'ready_to_ship') {
