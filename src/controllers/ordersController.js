@@ -1716,19 +1716,15 @@ export const palletPicker = async (req, res) => {
         const onWaterAvail = Math.max(0, Number(onWater.get(groupKey) || 0) - reservedOnWater);
         const onProcessAvail = Math.max(0, Number(onProcess.get(groupKey) || 0) - reservedOnProcess);
 
-        // Build On-Water shipments per EDD then deduct reserved On-Water qty earliest-first
+        // Build On-Water shipments per EDD (raw, not deducted)
         const shipListRaw = (onWaterShipments.get(groupKey) || [])
           .filter((x) => x?.d && !Number.isNaN(x.d.getTime()) && Number(x?.qty || 0) > 0)
           .sort((a, b) => a.d.getTime() - b.d.getTime())
           .map((x) => ({ edd: fmtDateYmd(x.d) || '', qty: Math.max(0, Math.floor(Number(x.qty || 0))) }));
-        let remainingOnWaterReserved = Math.max(0, reservedOnWater);
-        const adjustedShipList = shipListRaw.map((s) => {
-          if (remainingOnWaterReserved <= 0) return { ...s };
-          const take = Math.min(remainingOnWaterReserved, Math.max(0, s.qty));
-          const qty = Math.max(0, Math.floor(s.qty - take));
-          remainingOnWaterReserved -= take;
-          return { edd: s.edd, qty };
-        });
+        // Important: Do NOT deduct reserved from per-shipment breakdown here.
+        // The client needs raw shipment EDDs to determine the earliest shipment
+        // that satisfies the current order's reserved On‑Water quantity.
+        const adjustedShipList = shipListRaw;
 
         // Build On-Process batches per EDD then deduct reserved On-Process qty earliest-first
         const baseProcessBatches = Array.isArray(onProcessBatches.get(groupKey)) ? onProcessBatches.get(groupKey) : [];
