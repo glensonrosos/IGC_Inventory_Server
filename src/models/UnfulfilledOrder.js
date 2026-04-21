@@ -58,6 +58,7 @@ const unfulfilledOrderSchema = new mongoose.Schema(
     estFulfillmentDate: { type: Date },
     estDeliveredDate: { type: Date },
     shippingAddress: { type: String, trim: true },
+    paymentTerms: { type: String, trim: true },
     notes: { type: String, trim: true },
     lines: { type: [unfulfilledOrderLineSchema], default: [] },
     allocations: { type: [unfulfilledOrderAllocationSchema], default: [] },

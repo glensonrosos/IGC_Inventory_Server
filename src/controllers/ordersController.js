@@ -1262,7 +1262,7 @@ const applyFulfilledOrder = async ({ warehouseId, orderNumber, meta, lines, comm
 };
 
 export const createUnfulfilledOrder = async (req, res) => {
-  const { warehouseId, customerEmail, customerName, customerPhone, createdAtOrder, originalPrice, shippingPercent, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines = [], status } = req.body || {};
+  const { warehouseId, customerEmail, customerName, customerPhone, createdAtOrder, originalPrice, shippingPercent, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, paymentTerms, notes, lines = [], status } = req.body || {};
   if (!warehouseId) return res.status(400).json({ message: 'warehouseId required' });
   if (!Array.isArray(lines) || lines.length === 0) return res.status(400).json({ message: 'lines required' });
   if (!normalizeStr(customerPhone)) return res.status(400).json({ message: 'customerPhone required' });
@@ -1504,6 +1504,7 @@ export const createUnfulfilledOrder = async (req, res) => {
     estFulfillmentDate: estFulfillmentDate ? new Date(estFulfillmentDate) : undefined,
     estDeliveredDate: nextStatus === 'shipped' && normalizeStr(estDeliveredDate) ? new Date(normalizeStr(estDeliveredDate)) : undefined,
     shippingAddress: normalizeStr(shippingAddress),
+    paymentTerms: normalizeStr(paymentTerms),
     notes: normalizeStr(notes),
     lines: linesWithSnapshot.length ? linesWithSnapshot : parsedLines,
     allocations,
@@ -2325,7 +2326,7 @@ export const getUnfulfilledOrderById = async (req, res) => {
   const doc = await UnfulfilledOrder.findById(id)
     .populate('warehouseId', 'name')
     .populate('allocations.warehouseId', 'name')
-    .select('orderNumber warehouseId status allocations lines customerEmail customerName customerPhone createdAtOrder originalPrice shippingPercent discountPercent finalPrice estFulfillmentDate estDeliveredDate shippingAddress notes postActions committedBy lastUpdatedBy createdAt updatedAt')
+    .select('orderNumber warehouseId status allocations lines customerEmail customerName customerPhone createdAtOrder originalPrice shippingPercent discountPercent finalPrice estFulfillmentDate estDeliveredDate shippingAddress paymentTerms notes postActions committedBy lastUpdatedBy createdAt updatedAt')
     .lean();
   if (!doc) return res.status(404).json({ message: 'Order not found' });
 
@@ -2793,7 +2794,7 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
 
 export const updateUnfulfilledOrderDetails = async (req, res) => {
   const { id } = req.params;
-  const { customerName, customerEmail, customerPhone, originalPrice, shippingPercent, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, notes, lines } = req.body || {};
+  const { customerName, customerEmail, customerPhone, originalPrice, shippingPercent, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, paymentTerms, notes, lines } = req.body || {};
 
   const existing = await UnfulfilledOrder.findById(id).select('status warehouseId orderNumber lines originalPrice shippingPercent discountPercent').lean();
   if (!existing) return res.status(404).json({ message: 'Order not found' });
@@ -2818,6 +2819,7 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
     set.discountPercent = Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : null;
   }
   if (shippingAddress !== undefined) set.shippingAddress = normalizeStr(shippingAddress);
+  if (paymentTerms !== undefined) set.paymentTerms = normalizeStr(paymentTerms);
   if (notes !== undefined) set.notes = normalizeStr(notes);
   if (estFulfillmentDate !== undefined) {
     const s = normalizeStr(estFulfillmentDate);
