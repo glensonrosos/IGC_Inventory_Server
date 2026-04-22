@@ -33,6 +33,7 @@ const earlyBuyOrderSchema = new mongoose.Schema(
     originalPrice: { type: String, default: '' },
     shippingPercent: { type: String, default: '' },
     discountPercent: { type: String, default: '' },
+    paymentTerms: { type: String, default: '' },
     notes: { type: String, default: '' },
     lines: { type: [lineSchema], default: [] },
   },

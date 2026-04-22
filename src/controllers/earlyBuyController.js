@@ -69,6 +69,7 @@ export const updateEarlyBuy = async (req, res) => {
     originalPrice: String(b.originalPrice||'').trim(),
     shippingPercent: String(b.shippingPercent||'').trim(),
     discountPercent: String(b.discountPercent||'').trim(),
+    paymentTerms: String(b.paymentTerms||'').trim(),
     notes: String(b.notes||'').trim(),
     lines: lines.map((l)=> ({
       groupName: String(l?.groupName||'').trim(),
@@ -135,6 +136,7 @@ export const createEarlyBuy = async (req, res) => {
     originalPrice: String(b.originalPrice||'').trim(),
     shippingPercent: String(b.shippingPercent||'').trim(),
     discountPercent: String(b.discountPercent||'').trim(),
+    paymentTerms: String(b.paymentTerms||'').trim(),
     notes: String(b.notes||'').trim(),
     lines: lines.map((l)=> ({
       groupName: String(l?.groupName||'').trim(),
