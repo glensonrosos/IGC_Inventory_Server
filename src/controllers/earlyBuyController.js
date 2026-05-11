@@ -34,10 +34,12 @@ export const updateEarlyBuy = async (req, res) => {
   const containerArrival = String(b.containerArrival || '').slice(0,10);
   const estFulfillment = String(b.estFulfillment || '').slice(0,10);
   const estDelivered = String(b.estDelivered || '').slice(0,10);
+  const requestedShipDate = String(b.requestedShipDate || '').slice(0,10);
   const today = new Date().toISOString().slice(0,10);
   if (createdAt > today) return res.status(400).json({ message: 'Created Order Date cannot be in the future' });
   if (!estFulfillment) return res.status(400).json({ message: 'Estimated ShipDate for Customer is required' });
   if (estFulfillment && estFulfillment < createdAt) return res.status(400).json({ message: 'Estimated ShipDate must be ≥ Created Order Date' });
+  if (requestedShipDate && requestedShipDate <= createdAt) return res.status(400).json({ message: 'Requested Ship Date must be > Created Order Date' });
   if (String(b.status || '').trim().toLowerCase() === 'processing' && !containerArrival) {
     return res.status(400).json({ message: 'Container Arrival is required when status is PROCESSING' });
   }
@@ -62,6 +64,7 @@ export const updateEarlyBuy = async (req, res) => {
     containerArrival,
     estFulfillment,
     estDelivered,
+    requestedShipDate,
     customerEmail: String(b.customerEmail||'').trim(),
     customerName: String(b.customerName||'').trim(),
     customerPhone: String(b.customerPhone||'').trim(),
@@ -70,6 +73,7 @@ export const updateEarlyBuy = async (req, res) => {
     shippingPercent: String(b.shippingPercent||'').trim(),
     discountPercent: String(b.discountPercent||'').trim(),
     paymentTerms: String(b.paymentTerms||'').trim(),
+    paymentStatus: String(b.paymentStatus||'').trim(),
     notes: String(b.notes||'').trim(),
     lines: lines.map((l)=> ({
       groupName: String(l?.groupName||'').trim(),
@@ -103,6 +107,7 @@ export const createEarlyBuy = async (req, res) => {
   const containerArrival = String(b.containerArrival || '').slice(0,10);
   const estFulfillment = String(b.estFulfillment || '').slice(0,10);
   const estDelivered = String(b.estDelivered || '').slice(0,10);
+  const requestedShipDate = String(b.requestedShipDate || '').slice(0,10);
   const today = new Date().toISOString().slice(0,10);
   if (createdAt > today) return res.status(400).json({ message: 'Created Order Date cannot be in the future' });
   if (estFulfillment && estFulfillment < createdAt) return res.status(400).json({ message: 'Estimated ShipDate must be ≥ Created Order Date' });
@@ -113,6 +118,7 @@ export const createEarlyBuy = async (req, res) => {
     return res.status(400).json({ message: 'Container Arrival must be ≤ Estimated ShipDate for Customer' });
   }
   if (estDelivered && estDelivered < estFulfillment) return res.status(400).json({ message: 'Estimated Arrival Date must be ≥ Estimated ShipDate' });
+  if (requestedShipDate && requestedShipDate <= createdAt) return res.status(400).json({ message: 'Requested Ship Date must be > Created Order Date' });
 
   const lines = Array.isArray(b.lines) ? b.lines : [];
   if (!lines.some((l)=> Number(l?.qty||0) > 0)) {
@@ -129,6 +135,7 @@ export const createEarlyBuy = async (req, res) => {
     containerArrival,
     estFulfillment,
     estDelivered,
+    requestedShipDate,
     customerEmail: String(b.customerEmail||'').trim(),
     customerName: String(b.customerName||'').trim(),
     customerPhone: String(b.customerPhone||'').trim(),
@@ -137,6 +144,7 @@ export const createEarlyBuy = async (req, res) => {
     shippingPercent: String(b.shippingPercent||'').trim(),
     discountPercent: String(b.discountPercent||'').trim(),
     paymentTerms: String(b.paymentTerms||'').trim(),
+    paymentStatus: String(b.paymentStatus||'').trim(),
     notes: String(b.notes||'').trim(),
     lines: lines.map((l)=> ({
       groupName: String(l?.groupName||'').trim(),

@@ -1262,7 +1262,7 @@ const applyFulfilledOrder = async ({ warehouseId, orderNumber, meta, lines, comm
 };
 
 export const createUnfulfilledOrder = async (req, res) => {
-  const { warehouseId, customerEmail, customerName, customerPhone, createdAtOrder, originalPrice, shippingPercent, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, paymentTerms, notes, lines = [], status } = req.body || {};
+  const { warehouseId, customerEmail, customerName, customerPhone, createdAtOrder, originalPrice, shippingPercent, discountPercent, estFulfillmentDate, estDeliveredDate, requestedShipDate, shippingAddress, paymentTerms, paymentStatus, notes, lines = [], status } = req.body || {};
   if (!warehouseId) return res.status(400).json({ message: 'warehouseId required' });
   if (!Array.isArray(lines) || lines.length === 0) return res.status(400).json({ message: 'lines required' });
   if (!normalizeStr(customerPhone)) return res.status(400).json({ message: 'customerPhone required' });
@@ -1503,8 +1503,10 @@ export const createUnfulfilledOrder = async (req, res) => {
     finalPrice: hasOriginal ? computedFinal : undefined,
     estFulfillmentDate: estFulfillmentDate ? new Date(estFulfillmentDate) : undefined,
     estDeliveredDate: nextStatus === 'shipped' && normalizeStr(estDeliveredDate) ? new Date(normalizeStr(estDeliveredDate)) : undefined,
+    requestedShipDate: requestedShipDate ? new Date(requestedShipDate) : undefined,
     shippingAddress: normalizeStr(shippingAddress),
     paymentTerms: normalizeStr(paymentTerms),
+    paymentStatus: normalizeStr(paymentStatus) || '',
     notes: normalizeStr(notes),
     lines: linesWithSnapshot.length ? linesWithSnapshot : parsedLines,
     allocations,
@@ -1717,15 +1719,19 @@ export const palletPicker = async (req, res) => {
         const onWaterAvail = Math.max(0, Number(onWater.get(groupKey) || 0) - reservedOnWater);
         const onProcessAvail = Math.max(0, Number(onProcess.get(groupKey) || 0) - reservedOnProcess);
 
-        // Build On-Water shipments per EDD (raw, not deducted)
+        // Build On-Water shipments per EDD, then deduct reserved On‑Water qty earliest-first
         const shipListRaw = (onWaterShipments.get(groupKey) || [])
           .filter((x) => x?.d && !Number.isNaN(x.d.getTime()) && Number(x?.qty || 0) > 0)
           .sort((a, b) => a.d.getTime() - b.d.getTime())
           .map((x) => ({ edd: fmtDateYmd(x.d) || '', qty: Math.max(0, Math.floor(Number(x.qty || 0))) }));
-        // Important: Do NOT deduct reserved from per-shipment breakdown here.
-        // The client needs raw shipment EDDs to determine the earliest shipment
-        // that satisfies the current order's reserved On‑Water quantity.
-        const adjustedShipList = shipListRaw;
+        let remainingOnWaterReserved = Math.max(0, reservedOnWater);
+        const adjustedShipList = shipListRaw.map((s) => {
+          if (remainingOnWaterReserved <= 0) return { ...s };
+          const take = Math.min(remainingOnWaterReserved, Math.max(0, s.qty));
+          const qty = Math.max(0, Math.floor(s.qty - take));
+          remainingOnWaterReserved -= take;
+          return { edd: s.edd, qty };
+        });
 
         // Build On-Process batches per EDD then deduct reserved On-Process qty earliest-first
         const baseProcessBatches = Array.isArray(onProcessBatches.get(groupKey)) ? onProcessBatches.get(groupKey) : [];
@@ -2103,8 +2109,6 @@ export const updateImportedOrderDetails = async (req, res) => {
   const { id } = req.params;
   const existing = await FulfilledOrderImport.findById(id).lean();
   if (!existing) return res.status(404).json({ message: 'Order not found' });
-  if (normalizeOrderStatus(existing.status || '') === 'completed') return res.status(400).json({ message: 'Completed orders are locked' });
-
   const { email, billingName, billingPhone, shippingName, shippingStreet, fulfilledAt, createdAtOrder } = req.body || {};
   const set = {};
   const committedBy = String(req.user?.username || req.user?.id || '');
@@ -2326,7 +2330,7 @@ export const getUnfulfilledOrderById = async (req, res) => {
   const doc = await UnfulfilledOrder.findById(id)
     .populate('warehouseId', 'name')
     .populate('allocations.warehouseId', 'name')
-    .select('orderNumber warehouseId status allocations lines customerEmail customerName customerPhone createdAtOrder originalPrice shippingPercent discountPercent finalPrice estFulfillmentDate estDeliveredDate shippingAddress paymentTerms notes postActions committedBy lastUpdatedBy createdAt updatedAt')
+    .select('orderNumber warehouseId status allocations lines customerEmail customerName customerPhone createdAtOrder originalPrice shippingPercent discountPercent finalPrice estFulfillmentDate estDeliveredDate requestedShipDate shippingAddress paymentTerms paymentStatus notes postActions committedBy lastUpdatedBy createdAt updatedAt')
     .lean();
   if (!doc) return res.status(404).json({ message: 'Order not found' });
 
@@ -2794,15 +2798,27 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
 
 export const updateUnfulfilledOrderDetails = async (req, res) => {
   const { id } = req.params;
-  const { customerName, customerEmail, customerPhone, originalPrice, shippingPercent, discountPercent, estFulfillmentDate, estDeliveredDate, shippingAddress, paymentTerms, notes, lines } = req.body || {};
+  const { customerName, customerEmail, customerPhone, originalPrice, shippingPercent, discountPercent, estFulfillmentDate, estDeliveredDate, requestedShipDate, shippingAddress, paymentTerms, paymentStatus, notes, lines } = req.body || {};
 
   const existing = await UnfulfilledOrder.findById(id).select('status warehouseId orderNumber lines originalPrice shippingPercent discountPercent').lean();
   if (!existing) return res.status(404).json({ message: 'Order not found' });
-  if (normalizeOrderStatus(existing.status || '') === 'completed') return res.status(400).json({ message: 'Completed orders are locked' });
+  const isCompleted = normalizeOrderStatus(existing.status || '') === 'completed';
 
   const set = {};
   const committedBy = String(req.user?.username || req.user?.id || '');
   set.lastUpdatedBy = committedBy;
+  if (isCompleted) {
+    // Allow limited edits for completed orders: paymentTerms, paymentStatus, requestedShipDate
+    if (paymentTerms !== undefined) set.paymentTerms = normalizeStr(paymentTerms);
+    if (paymentStatus !== undefined) set.paymentStatus = normalizeStr(paymentStatus);
+    if (requestedShipDate !== undefined) {
+      const s = normalizeStr(requestedShipDate);
+      set.requestedShipDate = s ? new Date(s) : null;
+    }
+    await UnfulfilledOrder.updateOne({ _id: id }, { $set: set });
+    const doc = await UnfulfilledOrder.findById(id).lean();
+    return res.json(doc);
+  }
   if (customerName !== undefined) set.customerName = normalizeStr(customerName);
   if (customerEmail !== undefined) set.customerEmail = normalizeStr(customerEmail);
   if (customerPhone !== undefined) set.customerPhone = normalizeStr(customerPhone);
@@ -2820,6 +2836,11 @@ export const updateUnfulfilledOrderDetails = async (req, res) => {
   }
   if (shippingAddress !== undefined) set.shippingAddress = normalizeStr(shippingAddress);
   if (paymentTerms !== undefined) set.paymentTerms = normalizeStr(paymentTerms);
+  if (paymentStatus !== undefined) set.paymentStatus = normalizeStr(paymentStatus);
+  if (requestedShipDate !== undefined) {
+    const s = normalizeStr(requestedShipDate);
+    set.requestedShipDate = s ? new Date(s) : null;
+  }
   if (notes !== undefined) set.notes = normalizeStr(notes);
   if (estFulfillmentDate !== undefined) {
     const s = normalizeStr(estFulfillmentDate);
