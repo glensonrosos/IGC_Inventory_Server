@@ -68,8 +68,12 @@ export const updateItem = async (req, res) => {
   const allowed = ['itemGroup','description','color','price','totalQty','packSize','enabled','upc'];
   const updates = {};
   for (const k of allowed) if (k in req.body) updates[k] = req.body[k];
-  const target = await Item.findOne({ itemCode });
+  // Identify target by both itemCode and itemGroup when provided
+  const groupFromBody = typeof req.body.itemGroup === 'string' ? req.body.itemGroup : undefined;
+  const target = await Item.findOne(groupFromBody ? { itemCode, itemGroup: groupFromBody } : { itemCode });
   if (!target) return res.status(404).json({ message: 'Not found' });
+  // Treat itemGroup as the selector, not a mutable field here
+  if ('itemGroup' in updates) delete updates.itemGroup;
   if ('packSize' in updates && Number(updates.packSize) <= 0) return res.status(400).json({ message: 'packSize must be > 0' });
   if ('price' in updates) {
     const p = Number(updates.price);
@@ -81,11 +85,6 @@ export const updateItem = async (req, res) => {
   const incomingUpc = 'upc' in updates ? updates.upc : String(target.upc || '').trim();
   const siblings = await Item.find({ itemCode }).select('_id upc itemGroup').lean();
   // Allow different UPCs across pallet groups for the same Item Code during update
-  // If moving to a different pallet group, ensure no duplicate (itemCode,itemGroup)
-  if ('itemGroup' in updates && String(updates.itemGroup || '') !== String(target.itemGroup || '')) {
-    const exists = await Item.findOne({ itemCode, itemGroup: updates.itemGroup }).select('_id').lean();
-    if (exists) return res.status(409).json({ message: 'Item already exists in this pallet group' });
-  }
   try {
     const doc = await Item.findOneAndUpdate({ _id: target._id }, updates, { new: true });
     res.json(doc);
