@@ -37,15 +37,7 @@ export const createItem = async (req, res) => {
   const existingSameGroup = existingWithCode.find((it) => String(it.itemGroup || '') === String(itemGroup || ''));
   if (existingSameGroup) return res.status(409).json({ message: 'Item already exists in this pallet group' });
   const normalizedUpc = typeof upc === 'string' ? upc.trim() : '';
-  const canonicalUpc = existingWithCode.reduce((acc, it) => {
-    const val = String(it.upc || '').trim();
-    return acc || val;
-  }, '');
-  if (canonicalUpc && canonicalUpc !== normalizedUpc) {
-    const conflictGroup = existingWithCode.find((it) => String(it.upc || '').trim() === canonicalUpc)?.itemGroup || '';
-    const scope = conflictGroup ? ` in pallet group "${conflictGroup}"` : '';
-    return res.status(400).json({ message: `Item Code already uses UPC "${canonicalUpc}"${scope}. Please use the same UPC.` });
-  }
+  // Allow different UPCs across pallet groups for the same Item Code
   const p = Number(price);
   const priceValue = Number.isFinite(p) ? p : 0;
   const doc = await Item.create({
@@ -88,18 +80,22 @@ export const updateItem = async (req, res) => {
   }
   const incomingUpc = 'upc' in updates ? updates.upc : String(target.upc || '').trim();
   const siblings = await Item.find({ itemCode }).select('_id upc itemGroup').lean();
-  const canonicalUpc = siblings.reduce((acc, it) => {
-    if (String(it._id) === String(target._id)) return acc;
-    const val = String(it.upc || '').trim();
-    return acc || val;
-  }, '');
-  if (canonicalUpc && canonicalUpc !== incomingUpc) {
-    const conflictGroup = siblings.find((it) => String(it._id) !== String(target._id) && String(it.upc || '').trim() === canonicalUpc)?.itemGroup || '';
-    const scope = conflictGroup ? ` in pallet group "${conflictGroup}"` : '';
-    return res.status(400).json({ message: `Item Code already uses UPC "${canonicalUpc}"${scope}. Please use the same UPC.` });
+  // Allow different UPCs across pallet groups for the same Item Code during update
+  // If moving to a different pallet group, ensure no duplicate (itemCode,itemGroup)
+  if ('itemGroup' in updates && String(updates.itemGroup || '') !== String(target.itemGroup || '')) {
+    const exists = await Item.findOne({ itemCode, itemGroup: updates.itemGroup }).select('_id').lean();
+    if (exists) return res.status(409).json({ message: 'Item already exists in this pallet group' });
   }
-  const doc = await Item.findOneAndUpdate({ _id: target._id }, updates, { new: true });
-  res.json(doc);
+  try {
+    const doc = await Item.findOneAndUpdate({ _id: target._id }, updates, { new: true });
+    res.json(doc);
+  } catch (e) {
+    const code = e && (e.code || e?.errorResponse?.code);
+    if (code === 11000) {
+      return res.status(409).json({ message: 'Item already exists in this pallet group' });
+    }
+    throw e;
+  }
 };
 
 export const deleteItem = async (req, res) => {

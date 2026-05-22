@@ -334,7 +334,6 @@ export const importItemGroups = async (req, res) => {
       }
       // Build parsed item rows with row numbers
       const itemParsed = [];
-      const upcByItemCodeInFile = new Map();
       for (let i = 1; i < rows.length; i++) {
         const row = rows[i];
         const rawDesc = (row[nameIdx] ?? '').toString().trim();
@@ -368,20 +367,7 @@ export const importItemGroups = async (req, res) => {
         if (!desc) missingRequired('Item Description', rowNum, groupName || rawDesc);
         if (!color) missingRequired('Color', rowNum, groupName || rawDesc);
 
-        const codeLower = itemCode.toLowerCase();
-        if (codeLower) {
-          const prevUpc = upcByItemCodeInFile.get(codeLower);
-          const normUpc = (upc || '').trim();
-          if (prevUpc === undefined) {
-            upcByItemCodeInFile.set(codeLower, normUpc);
-          } else if (prevUpc !== normUpc) {
-            errors.push({
-              rowNum,
-              itemCode,
-              errors: ['Item Code must use the same UPC for every row in the import file']
-            });
-          }
-        }
+        // Allow different UPCs for the same Item Code within the import file.
 
         let priceNum;
         if (priceIdx >= 0) {
@@ -417,36 +403,16 @@ export const importItemGroups = async (req, res) => {
         ? await Item.find({ itemCode: { $in: uniqueItemCodes } }).select('itemCode itemGroup description color packSize price upc')
         : [];
       const existingByGroupAndCode = new Map();
-      const existingUpcByCode = new Map();
       for (const item of existingItems) {
         const codeLower = String(item.itemCode || '').toLowerCase();
         const groupLower = String(item.itemGroup || '').toLowerCase();
-        const upcNorm = String(item.upc || '').trim();
         existingByGroupAndCode.set(`${groupLower}|${codeLower}`, item);
-        if (!existingUpcByCode.has(codeLower)) {
-          existingUpcByCode.set(codeLower, upcNorm);
-        } else {
-          const stored = existingUpcByCode.get(codeLower) || '';
-          if (!stored && upcNorm) {
-            existingUpcByCode.set(codeLower, upcNorm);
-          }
-        }
       }
 
       for (const r of byKey.values()) {
-        const codeLower = r.itemCode.toLowerCase();
-        const incomingUpc = String(r.upc || '').trim();
-        const canonicalUpc = existingUpcByCode.get(codeLower) || '';
-        if (canonicalUpc && canonicalUpc !== incomingUpc) {
-          errors.push({
-            rowNum: r.rowNum,
-            itemCode: r.itemCode,
-            itemGroup: r.groupName,
-            errors: [`Item Code has UPC "${canonicalUpc}" in the system but the file provides "${incomingUpc || '(blank)'}"`]
-          });
-          continue;
-        }
+        // Allow incoming UPC to differ from existing system UPC; latest value in file will be applied per group+itemCode.
 
+        const codeLower = String(r.itemCode || '').toLowerCase();
         const existing = existingByGroupAndCode.get(`${r.groupName.toLowerCase()}|${codeLower}`);
         if (existing) {
           const changes = {};
