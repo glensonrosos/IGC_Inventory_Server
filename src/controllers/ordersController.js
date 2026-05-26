@@ -423,6 +423,25 @@ const rebalanceProcessingOrderAllocations = async ({ order, resolveToGroupName }
       }
     }
 
+    // 2) on-process -> on-water (when on-water capacity opens up)
+    const op2 = Math.max(0, Number(orderOnProcess.get(g) || 0));
+    if (op2 > 0) {
+      const onWaterTotal = Math.max(0, Number(onWaterMap.get(g) || 0));
+      const onWaterReserved = Math.max(0, Number(reservedOnWaterTotals.get(g) || 0));
+      const onWaterAvail = Math.max(0, onWaterTotal - onWaterReserved);
+      const take = Math.min(op2, onWaterAvail);
+      if (take > 0) {
+        await decReservation({ groupName: g, source: 'on_process', qty: take });
+        await incReservation({ groupName: g, source: 'on_water', qty: take });
+        decAlloc(g, take, 'on_process');
+        addAlloc(g, take, 'on_water');
+
+        orderOnProcess.set(g, op2 - take);
+        reservedOnWaterTotals.set(g, onWaterReserved + take);
+        moved = true;
+      }
+    }
+
     // 3) on-process -> second
     const op = Math.max(0, Number(orderOnProcess.get(g) || 0));
     if (wh2 && op > 0) {
@@ -2628,10 +2647,13 @@ export const updateUnfulfilledOrderStatus = async (req, res) => {
     doc.status = 'canceled';
     doc.lastUpdatedBy = committedBy;
     await doc.save();
-    // Immediately trigger a focused rebalance so other PROCESSING/READY TO SHIP orders can claim freed stock
+    // Immediately trigger a focused rebalance for affected pallet groups so other orders can claim freed stock
     try {
       const wid = String(doc.warehouseId || '').trim();
-      await rebalanceProcessingOrdersInternal({ warehouseId: wid || undefined });
+      const groupNames = Array.isArray(doc?.lines)
+        ? doc.lines.map((l) => String(l?.groupName || '').trim()).filter((v) => v)
+        : [];
+      await rebalanceProcessingOrdersInternal({ warehouseId: wid || undefined, groupNames: groupNames.length ? groupNames : undefined });
     } catch (e) {
       // best-effort; do not block cancel on rebalance failure
     }
