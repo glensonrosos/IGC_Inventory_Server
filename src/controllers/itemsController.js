@@ -25,21 +25,28 @@ export const listItems = async (req, res) => {
 };
 
 export const createItem = async (req, res) => {
-  const { itemCode, itemGroup, description, color, totalQty, packSize, enabled } = req.body || {};
+  const { itemCode, itemGroup, description, color, price, totalQty, packSize, enabled, upc } = req.body || {};
   if (!itemCode) return res.status(400).json({ message: 'itemCode required' });
   if (packSize != null && Number(packSize) < 0) return res.status(400).json({ message: 'packSize must be >= 0' });
   if (itemGroup) {
     const groupDoc = await ItemGroup.findOne({ name: itemGroup }).lean();
-    if (!groupDoc) return res.status(400).json({ message: 'Pallet Description not found' });
-    if (groupDoc.active === false) return res.status(400).json({ message: 'Pallet Description is inactive' });
+    if (!groupDoc) return res.status(400).json({ message: 'Pallet Group not found' });
+    if (groupDoc.active === false) return res.status(400).json({ message: 'Pallet Group is inactive' });
   }
-  const exists = await Item.findOne({ itemCode, itemGroup: itemGroup || '' });
-  if (exists) return res.status(409).json({ message: 'Item already exists in this pallet description' });
+  const existingWithCode = await Item.find({ itemCode }).select('itemCode itemGroup upc').lean();
+  const existingSameGroup = existingWithCode.find((it) => String(it.itemGroup || '') === String(itemGroup || ''));
+  if (existingSameGroup) return res.status(409).json({ message: 'Item already exists in this pallet group' });
+  const normalizedUpc = typeof upc === 'string' ? upc.trim() : '';
+  // Allow different UPCs across pallet groups for the same Item Code
+  const p = Number(price);
+  const priceValue = Number.isFinite(p) ? p : 0;
   const doc = await Item.create({
     itemCode,
     itemGroup: itemGroup || '',
     description: description || '',
     color: color || '',
+    upc: normalizedUpc,
+    price: priceValue,
     totalQty: Number(totalQty) || 0,
     packSize: (packSize == null ? 0 : Number(packSize)),
     enabled: typeof enabled === 'boolean' ? enabled : true,
@@ -58,13 +65,36 @@ export const getItem = async (req, res) => {
 
 export const updateItem = async (req, res) => {
   const { itemCode } = req.params;
-  const allowed = ['itemGroup','description','color','totalQty','packSize','enabled'];
+  const allowed = ['itemGroup','description','color','price','totalQty','packSize','enabled','upc'];
   const updates = {};
   for (const k of allowed) if (k in req.body) updates[k] = req.body[k];
+  // Identify target by both itemCode and itemGroup when provided
+  const groupFromBody = typeof req.body.itemGroup === 'string' ? req.body.itemGroup : undefined;
+  const target = await Item.findOne(groupFromBody ? { itemCode, itemGroup: groupFromBody } : { itemCode });
+  if (!target) return res.status(404).json({ message: 'Not found' });
+  // Treat itemGroup as the selector, not a mutable field here
+  if ('itemGroup' in updates) delete updates.itemGroup;
   if ('packSize' in updates && Number(updates.packSize) <= 0) return res.status(400).json({ message: 'packSize must be > 0' });
-  const doc = await Item.findOneAndUpdate({ itemCode }, updates, { new: true });
-  if (!doc) return res.status(404).json({ message: 'Not found' });
-  res.json(doc);
+  if ('price' in updates) {
+    const p = Number(updates.price);
+    updates.price = Number.isFinite(p) ? p : 0;
+  }
+  if ('upc' in updates) {
+    updates.upc = typeof updates.upc === 'string' ? updates.upc.trim() : '';
+  }
+  const incomingUpc = 'upc' in updates ? updates.upc : String(target.upc || '').trim();
+  const siblings = await Item.find({ itemCode }).select('_id upc itemGroup').lean();
+  // Allow different UPCs across pallet groups for the same Item Code during update
+  try {
+    const doc = await Item.findOneAndUpdate({ _id: target._id }, updates, { new: true });
+    res.json(doc);
+  } catch (e) {
+    const code = e && (e.code || e?.errorResponse?.code);
+    if (code === 11000) {
+      return res.status(409).json({ message: 'Item already exists in this pallet group' });
+    }
+    throw e;
+  }
 };
 
 export const deleteItem = async (req, res) => {
@@ -94,6 +124,7 @@ export const importItemsExcel = async (req, res) => {
       itemCode: norm(r['Item Code'] ?? r['item code'] ?? r['ItemCode'] ?? r['itemcode']),
       itemGroup: norm(r['Pallet Description'] ?? r['pallet description'] ?? r['Pallet Group'] ?? r['pallet group'] ?? r['Item Group'] ?? r['item group'] ?? r['ItemGroup'] ?? r['itemgroup']),
       description: norm(r['Item Description'] ?? r['item description'] ?? r['Description'] ?? r['description']),
+      upc: norm(r['UPC'] ?? r['upc']),
       color: norm(r['Color'] ?? r['color']),
       packSize: Number(String(r['Pack Size'] ?? r['pack size'] ?? r['PackSize'] ?? '').toString().trim()),
       enabled: toBool(r['Enable'] ?? r['enabled'] ?? r['Enabled']),
@@ -116,7 +147,7 @@ export const importItemsExcel = async (req, res) => {
       if (Number(r.packSize) < 0) { errors.push({ rowNum: r.rowNum, itemCode: r.itemCode, errors: ['Pack Size must be >= 0'] }); skipped++; continue; }
       if (!groupSet.has(r.itemGroup)) {
         const found = existingGroups.find(g=>g.name===r.itemGroup);
-        const reason = found && found.active === false ? 'Item Group is inactive' : 'Item Group not registered';
+        const reason = found && found.active === false ? 'Pallet Group is inactive' : 'Pallet Group not registered';
         errors.push({ rowNum: r.rowNum, itemCode: r.itemCode, errors: [reason] }); skipped++; continue; }
       const key = `${r.itemGroup.toLowerCase()}|${r.itemCode.toLowerCase()}`;
       if (!byKey.has(key)) {
@@ -141,12 +172,13 @@ export const importItemsExcel = async (req, res) => {
         const changes = {};
         if (existing.description !== r.description) changes.description = r.description;
         if (existing.color !== r.color) changes.color = r.color;
+        if (String(existing.upc || '') !== String(r.upc || '')) changes.upc = r.upc;
         if (Number(existing.packSize) !== Number(r.packSize)) changes.packSize = Number(r.packSize);
         if (typeof r.enabled === 'boolean' && existing.enabled !== r.enabled) changes.enabled = r.enabled;
         if (Object.keys(changes).length) { await Item.updateOne({ _id: existing._id }, { $set: changes }); updated++; }
         else { skipped++; }
       } else {
-        await Item.create({ itemCode: r.itemCode, itemGroup: r.itemGroup, description: r.description, color: r.color, totalQty: 0, packSize: Number(r.packSize), enabled: (r.enabled === undefined ? true : r.enabled) });
+        await Item.create({ itemCode: r.itemCode, itemGroup: r.itemGroup, description: r.description, color: r.color, upc: r.upc || '', totalQty: 0, packSize: Number(r.packSize), enabled: (r.enabled === undefined ? true : r.enabled) });
         created++;
       }
     }

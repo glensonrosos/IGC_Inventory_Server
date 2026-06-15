@@ -5,6 +5,17 @@ const unfulfilledOrderLineSchema = new mongoose.Schema(
     lineItem: { type: String, required: true, trim: true },
     groupName: { type: String, required: true, trim: true },
     qty: { type: Number, required: true },
+    discountPercent: { type: Number },
+    // Persisted per-line price at time of add/save; new rows without this will pull latest from registry
+    unitPrice: { type: Number },
+    // Snapshot of base availability tiers at the time of save
+    baseTiers: {
+      primary: { type: Number },
+      onWater: { type: Number },
+      second: { type: Number },
+      onProcess: { type: Number },
+      total: { type: Number },
+    },
   },
   { _id: false }
 );
@@ -46,7 +57,10 @@ const unfulfilledOrderSchema = new mongoose.Schema(
     finalPrice: { type: Number },
     estFulfillmentDate: { type: Date },
     estDeliveredDate: { type: Date },
+    requestedShipDate: { type: Date },
     shippingAddress: { type: String, trim: true },
+    paymentTerms: { type: String, trim: true },
+    paymentStatus: { type: String, trim: true, default: '' },
     notes: { type: String, trim: true },
     lines: { type: [unfulfilledOrderLineSchema], default: [] },
     allocations: { type: [unfulfilledOrderAllocationSchema], default: [] },
