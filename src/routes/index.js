@@ -18,6 +18,7 @@ import warehouseStockRouter from './warehouseStock.js';
 import onProcessRouter from './onProcess.js';
 import palletInventoryRouter from './palletInventory.js';
 import usersRouter from './users.js';
+import customersRouter from './customers.js';
 
 const router = Router();
 router.use('/auth', authRouter);
@@ -38,5 +39,6 @@ router.use('/warehouse-stock', authRequired, warehouseStockRouter);
 router.use('/on-process', authRequired, onProcessRouter);
 router.use('/pallet-inventory', authRequired, palletInventoryRouter);
 router.use('/users', authRequired, usersRouter);
+router.use('/customers', authRequired, customersRouter);
 
 export default router;

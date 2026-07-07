@@ -47,9 +47,13 @@ const unfulfilledOrderSchema = new mongoose.Schema(
   {
     orderNumber: { type: String, required: true, unique: true, trim: true },
     warehouseId: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse', required: true, index: true },
+    customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer' },
     customerEmail: { type: String, trim: true },
     customerName: { type: String, trim: true },
     customerPhone: { type: String, trim: true },
+    accountNumber: { type: String, trim: true },
+    salesRepresentative: { type: String, trim: true },
+    companyName: { type: String, trim: true },
     createdAtOrder: { type: Date },
     originalPrice: { type: Number },
     shippingPercent: { type: Number },
