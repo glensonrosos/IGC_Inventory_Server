@@ -8,7 +8,7 @@ WORKDIR /usr/src/app
 COPY package.json ./
 
 # Install dependencies
-RUN yarn install
+RUN yarn install --network-timeout 600000
 
 # Copy the app's source code into the container
 COPY . .
